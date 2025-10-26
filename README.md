@@ -1,6 +1,6 @@
 # 🦘📊 iNaturalist Bioblitz Data Dive
 
-Comprehensive statistical analysis and visualization toolkit for iNaturalist bioblitz projects. Transform your bioblitz data into publication-quality figures, spatial analyses, and professional presentations!
+Statistical analysis and visualization toolkit for iNaturalist bioblitz projects. Transform your bioblitz into charts and spatial analyses to help you and your participants share the bigger picture in a presentation
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![R](https://img.shields.io/badge/R-%3E%3D4.0-blue)](https://www.r-project.org/)
