@@ -425,7 +425,7 @@ For more help, see the [Troubleshooting section](DATA_DIVE_GUIDE.md#troubleshoot
 
 ## 🌟 Comparison with Slideshow Generator
 
-This Data Dive script complements the [iNaturalist Bioblitz Slideshow Generator](https://github.com/yourusername/inaturalist-bioblitz-slideshow):
+This Data Dive script complements the [iNaturalist Bioblitz Slideshow Generator](https://github.com/ollybolly/inaturalist-bioblitz-slideshow):
 
 | Feature | Data Dive | Slideshow Generator |
 |---------|-----------|-------------------|
