@@ -431,7 +431,7 @@ This Data Dive script complements the [iNaturalist Bioblitz Slideshow Generator]
 |---------|-----------|-------------------|
 | **Purpose** | Statistical analysis | Visual presentation |
 | **Output** | Charts, maps, statistics | Photo slideshow |
-| **Best for** | Research, reporting | Event displays, outreach |
+| **Best for** | Research, event displays | Event displays, outreach |
 | **Figures** | 10+ analytical figures | Random photo selection |
 | **Format** | HTML + PowerPoint | HTML slideshow |
 | **Timing** | One-time or periodic | Daily updates |
