@@ -490,16 +490,6 @@ Under the following conditions:
 - [Quarto Documentation](https://quarto.org/docs/guide/)
 - [Spatial Analysis in R](https://r-spatial.org/)
 
-## 📚 Citation
-
-If you use this script in research or publications, please cite:
-
-```
-Berry, O., & Claude (2025). iNaturalist Bioblitz Data Dive: 
-Comprehensive Analysis Toolkit for Bioblitz Projects. 
-GitHub: https://github.com/yourusername/inaturalist-bioblitz-datadive
-```
-
 ---
 
 **Happy Analyzing!** 📊🔬🌿
