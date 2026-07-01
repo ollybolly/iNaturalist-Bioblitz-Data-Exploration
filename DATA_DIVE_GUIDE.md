@@ -1,401 +1,411 @@
-# Data Dive Script - Generalization Guide
+# iNaturalist Bioblitz Data Dive
+## Complete Guide
 
-## Overview
-
-The Data Dive script has been generalized to work with any iNaturalist bioblitz project. This guide explains what changed and how to adapt it for your bioblitz.
-
----
-
-## What This Script Does
-
-The Data Dive script creates a comprehensive analytical presentation from your iNaturalist bioblitz data, including:
-
-1. **Summary Statistics** - Total observations, species, observers, quality grades
-2. **Observation Hotspots** - Spatial maps showing where observations occurred
-3. **Taxonomic Breakdown** - Distribution across taxon groups (plants, insects, birds, etc.)
-4. **Top Observers** - Who contributed the most observations
-5. **Temporal Patterns** - Observations by time of day (day vs. night activity)
-6. **Species Richness Heatmaps** - Where the most species were found
-7. **Rarefaction Curves** - Species accumulation patterns showing sampling completeness
-8. **Multiple Output Formats** - HTML slideshow (Reveal.js) and PowerPoint (.pptx)
+**Version 3**
 
 ---
 
-## Key Changes from Original Version
+## Table of contents
 
-### 1. **New Configuration Variables**
-
-Added two new variables to customize the presentation:
-
-```r
-bioblitz_name <- "Walpole Wilderness"   # Your bioblitz location name
-bioblitz_year <- 2025                   # Year of your bioblitz
-```
-
-These automatically update:
-- Title slide: "{bioblitz_name} Bioblitz {bioblitz_year}"
-- All slide headers and labels
-
-### 2. **Simplified Output Directory**
-
-Changed from:
-```r
-out_dir <- "outputs/walpole_wilderness_bioblitz_2025_data_dive"
-```
-
-To:
-```r
-out_dir <- "outputs/data_dive"  # Created automatically
-```
-
-All output files go into `outputs/data_dive/` with subdirectories for slides and styles.
-
-### 3. **Generic Script Header**
-
-Changed from "Walpole Wilderness Bioblitz 2025 - Data Dive Analysis" to:
-```r
-# iNaturalist Bioblitz Data Dive Analysis
-```
-
-### 4. **Usage Instructions Added**
-
-Added clear comments at the top of the configuration section listing what needs to be changed:
-1. project_slug
-2. bioblitz_name
-3. bioblitz_year
-4. date_min and date_max
-5. hq_lon and hq_lat
-6. bioblitz_logo (optional)
+1. [Introduction](#introduction)
+2. [What the script produces](#what-the-script-produces)
+3. [Prerequisites](#prerequisites)
+4. [The companion style file](#the-companion-style-file)
+5. [Setup and configuration](#setup-and-configuration)
+6. [Running the script](#running-the-script)
+7. [Configuration reference](#configuration-reference)
+8. [The figures explained](#the-figures-explained)
+9. [Output files](#output-files)
+10. [Reruns and the figure cache](#reruns-and-the-figure-cache)
+11. [Performance](#performance)
+12. [Troubleshooting](#troubleshooting)
+13. [Tips and best practices](#tips-and-best-practices)
+14. [Companion: the photo Slideshow deck](#companion-the-photo-slideshow-deck)
 
 ---
 
-## How to Use This Script for Your Bioblitz
+## Introduction
 
-### Required Changes (Minimum Configuration)
+The Data Dive script builds an analytical presentation from an iNaturalist bioblitz project. It fetches your observations, produces a set of charts, maps and spatial analyses, and assembles them into a Quarto reveal.js deck, with an optional PowerPoint. It works for any project once you set a few values at the top of the script.
 
-At the top of the script, update these settings:
+It is the analytical companion to the photo Slideshow deck. Where the Slideshow celebrates individual finds, the Data Dive tells the quantitative story: how much was recorded, by whom, where, when, and how completely.
 
-```r
-# --- Project Settings ---
-project_slug <- "your-project-slug-2024"           # Your iNaturalist project
-bioblitz_name <- "Your Bioblitz Location"          # Appears on slides
-bioblitz_year <- 2024                              # Year
+**What changed in version 3**
 
-# --- HQ Location ---
-hq_lon <- 123.456789    # Your HQ longitude
-hq_lat <- -12.345678    # Your HQ latitude
-
-# --- Event Window ---
-date_min <- as.Date("2024-10-15")
-date_max <- as.Date("2024-10-16")
-
-# --- Logo (optional) ---
-bioblitz_logo <- "your-logo.jpg"  # Or "" if no logo
-```
-
-### How to Find Your Values
-
-**project_slug:**
-- Go to your iNaturalist project page
-- URL format: `https://www.inaturalist.org/projects/YOUR-PROJECT-SLUG`
-- Copy everything after `/projects/`
-
-**HQ Coordinates:**
-- Go to Google Maps
-- Right-click on your meeting/HQ location
-- Click the coordinates to copy
-- Format: longitude first, then latitude
-
-**Event Dates:**
-- Use the format: `as.Date("YYYY-MM-DD")`
-- For multi-day events, set date_min to first day, date_max to last day
+- The script now loads the shared `bioblitz_style.R` for the palette and PhyloPic taxon icons, so its colours and icons match the photo deck. That file must sit next to the script.
+- Maps use a satellite base map controlled by `base_map_zoom` and `buffer_km`. The old `map_provider` option is gone.
+- Rendering is done by Quarto (HTML and PowerPoint both come from `quarto::quarto_render`). PowerPoint is off by default.
+- New figures were added: species tiers, species rank abundance (with a plants-excluded view), an environmental module (distance to track and rank abundance), stacked observations by hour, and a chart collage.
+- Reveal.js playback settings were added (`auto_advance_ms`, `auto_slide_stoppable`, `slideshow_loop`).
+- The title slide and the map projection now build from your settings and HQ location, so the deck rebrands and reprojects itself for any bioblitz.
 
 ---
 
-## Output Files
+## What the script produces
 
-After running successfully, check `outputs/data_dive/`:
+Working from your project data, the script generates these analyses. Each becomes a figure in the deck (see [The figures explained](#the-figures-explained)):
 
-### Main Files:
-- **datadive.html** - Interactive HTML slideshow (Reveal.js)
-  - Press 'F' for fullscreen
-  - Arrow keys to navigate
-  - Press 'S' for speaker view
-  
-- **datadive.pptx** - PowerPoint presentation
-  - Editable in PowerPoint/Google Slides
-  - All figures included as images
+- Headline summary with a photo collage.
+- Observation hotspots (all taxa, and a plants-excluded view).
+- Taxonomic breakdown as a treemap or bar chart.
+- Top observers.
+- Activity by hour of day, with day and night shaded, and a stacked-by-taxon view.
+- Species richness heatmaps: raw, effort-corrected, and IDW-interpolated.
+- Rarefaction curves for all taxa and by group.
+- Species rank abundance, annotated, with a plants-excluded view.
+- A species tiers photo grid.
+- An environmental module: distance to track and rank abundance.
+- A chart collage.
 
-### Supporting Files:
-- **slides/** - Individual figure PNG files
-  - `fig_summary_with_photos.png`
-  - `fig_observation_hotspots_jittered.png`
-  - `fig_observations_by_taxon.png`
-  - `fig_top_observers.png`
-  - `fig_observations_by_hour.png`
-  - `fig_richness_raw.png`
-  - `fig_rarefaction_all.png`
-  - And more...
-
-- **styles/** - CSS styling files
-  - `custom.css` - Presentation styling
-
-### Cache Files:
-- **obs_cache.rds** - Cached observation data
-- **photo_cache/** - Downloaded photos for summary slide
-
-**Don't delete cache files!** They make subsequent runs much faster.
+Outputs are a reveal.js HTML deck and, optionally, a PowerPoint.
 
 ---
 
-## Advanced Configuration
+## Prerequisites
 
-### Map Settings
+### Software
 
-Control map appearance and coverage:
+1. **R** 4.0 or newer. https://cran.r-project.org/
+2. **RStudio Desktop.** https://posit.co/download/rstudio-desktop/
+3. **Quarto.** https://quarto.org/ Needed to render the deck. RStudio ships with a copy; if rendering fails, install Quarto and the `quarto` R package.
 
-```r
-map_provider <- "Esri.WorldImagery"  # Type of map
-base_map_zoom <- 14                  # Zoom level (13-15 recommended)
-buffer_km <- 2.5                     # Buffer around observations (km)
-```
+### R packages (installed automatically on first run)
 
-**Map Provider Options (affects download speed!):**
-- `"Esri.WorldImagery"` - Beautiful satellite imagery (SLOW for large areas)
-- `"OpenStreetMap"` - Fast street map (10-20x faster)
-- `"CartoDB.Positron"` - Minimal clean map (FASTEST)
-- `"CartoDB.Voyager"` - Balanced map (FAST, good looking)
-- `"Esri.WorldTopoMap"` - Topographic map (MEDIUM speed)
+- **Core and data:** `httr2`, `jsonlite`, `dplyr`, `tidyr`, `purrr`, `stringr`, `lubridate`, `janitor`, `glue`, `readr`, `tibble`, `forcats`
+- **Maps and spatial:** `sf`, `maptiles`, `terra`, `tidyterra`, `osmdata`, `ggspatial`, `stars`
+- **Plotting:** `ggplot2`, `scales`, `viridis`, `patchwork`, `cowplot`, `treemapify`, `ggimage`, `magick`, `rsvg`
+- **Analysis:** `suncalc`
+- **Palette and taxon icons:** `wesanderson`, `ggtext`, `rphylopic`, `png`
+- **Rendering:** `quarto`
 
-**Performance Optimization for Large Areas:**
+First-time installation can take 15 to 20 minutes.
 
-If your bioblitz covers >50km², map downloads can be very slow with satellite imagery. Use these settings for 10-20x faster generation:
+### Your bioblitz information
 
-```r
-map_provider <- "OpenStreetMap"  # or "CartoDB.Positron"
-base_map_zoom <- 12              # Reduce detail
-buffer_km <- 1.5                 # Smaller area
-```
-
-**Example:** A 100km² bioblitz:
-- With satellite: 20-30 minutes map download
-- With OpenStreetMap: 2-3 minutes map download
-
-### Figure Display Options
-
-```r
-fig2_use_treemap <- TRUE       # TRUE = treemap, FALSE = bar chart
-n_top_observers <- 15          # Number of observers to show
-```
-
-### Output Format Options
-
-```r
-render_html <- TRUE            # Generate HTML slideshow
-render_powerpoint <- TRUE      # Generate PowerPoint
-```
-
-### Heatmap Analysis
-
-Fine-tune spatial richness analysis:
-
-```r
-grid_cell_size_m <- 500        # Grid resolution (250-1000m)
-min_obs_per_cell <- 3          # Minimum observations per cell
-use_interpolation <- TRUE      # Smooth interpolated surface
-```
-
-### Rarefaction Analysis
-
-Control species accumulation curves:
-
-```r
-n_permutations <- 100          # More = smoother curves (50-500)
-step_size <- 10                # Sample frequency (5-20)
-```
+- **Project slug**, from the project URL after `/projects/`.
+- **Event dates**, as `as.Date("YYYY-MM-DD")`.
+- **HQ coordinates**, from Google Maps (right-click and copy). Longitude first, latitude second.
+- Optionally a **logo** (JPG or PNG).
 
 ---
 
-## Example Configurations
+## The companion style file
 
-### Small Urban Bioblitz
-```r
-project_slug <- "city-park-bioblitz-2024"
-bioblitz_name <- "City Park"
-bioblitz_year <- 2024
-date_min <- as.Date("2024-06-15")
-date_max <- as.Date("2024-06-15")
-base_map_zoom <- 15
-buffer_km <- 1.5
-grid_cell_size_m <- 250
+Version 3 loads `bioblitz_style.R` on startup for the shared Wes Anderson palette and the PhyloPic taxon-icon helpers. **It must be in the same folder as the script.**
+
+If you ever see an error about `bioblitz_style.R` not being found, this is the cause. Put the file next to the script and run from that folder.
+
+### Where to put everything
+
+The simplest setup is one folder containing the script and the style file. If you also run the photo Slideshow deck, keeping everything together lets both decks share a single style file and icon cache:
+
+```
+your-project-folder/
+├── Walpole_Bioblitz_Data_Dive_Slideshow_Script_V3.R
+├── bioblitz_style.R
+├── taxon_icons/            # created automatically on first run
+└── outputs/               # created automatically
 ```
 
-### Large Regional Bioblitz
-```r
-project_slug <- "regional-biodiversity-survey-2024"
-bioblitz_name <- "Regional Nature Reserve"
-bioblitz_year <- 2024
-date_min <- as.Date("2024-09-20")
-date_max <- as.Date("2024-09-22")
-base_map_zoom <- 13
-buffer_km <- 5
-grid_cell_size_m <- 1000
-```
+### The taxon icon cache
 
-### Weekend Nature Challenge
-```r
-project_slug <- "weekend-nature-challenge-fall-2024"
-bioblitz_name <- "Fall Nature Challenge"
-bioblitz_year <- 2024
-date_min <- as.Date("2024-10-12")
-date_max <- as.Date("2024-10-13")
-```
+On the first run, the style file fetches taxon silhouettes from PhyloPic (internet needed once), recolours them to the palette, and caches them in a `taxon_icons/` folder created **next to the script**, not inside the output folder. After that it works offline, and the cache is shared with the photo deck.
+
+### Using your own taxon icons
+
+Drop a PNG named after the iconic taxon, in lowercase letters only, into `taxon_icons/`, and it is used as-is. Recognised names include `plantae.png`, `aves.png`, `insecta.png`, `mammalia.png`, `actinopterygii.png`, `amphibia.png`, `reptilia.png`, `fungi.png`, `arachnida.png`, `mollusca.png`, `animalia.png`, `chromista.png` and `protozoa.png`.
+
+### Changing the palette
+
+The taxon colours come from the `taxon_cols` vector at the top of `bioblitz_style.R`. Edit a colour there and it flows through to every chart, map legend and icon. After a palette change, delete the cached icons (or set the icon rebuild flag in the style file) so the silhouettes are re-tinted.
 
 ---
 
-## Tips and Best Practices
+## Setup and configuration
 
-### First Run
-1. **Be patient!** First run takes 15-30 minutes:
-   - Package installation (if needed)
-   - Data download from iNaturalist
-   - Figure generation (10+ complex figures)
-   - Map tile downloads
+Open the script in RStudio and set the working directory to its folder (Session, Set Working Directory, To Source File Location). Then edit the settings near the top.
 
-2. **Use caching:**
-   ```r
-   use_cached_data <- TRUE
-   force_rebuild <- FALSE
-   ```
+### Essential settings
 
-### Subsequent Runs
-- Set `use_cached_data <- TRUE` (reuse downloaded data)
-- Set `force_rebuild <- FALSE` (reuse generated figures)
-- Only regenerate specific figures by deleting their PNG files
+```r
+project_slug   <- "your-project-slug"          # from your iNaturalist project URL
+bioblitz_name  <- "Your Bioblitz"               # shown on the title slide
+date_min       <- as.Date("2025-10-04")         # first day of the event
+date_max       <- as.Date("2025-10-05")         # last day
+hq_lon         <- 116.634398                     # headquarters longitude
+hq_lat         <- -34.992854                     # headquarters latitude
+bioblitz_logo  <- "your-logo.jpg"                # same folder, or "" for none
+quality_grades <- c("research", "needs_id")      # observation grades to include
+out_dir        <- "outputs/your_project_data_dive"
+```
 
-### Testing
-- Start with a small project to test your configuration
-- Check that coordinates are correct (HQ marker should appear in right place)
-- Verify date range captures your event
+**Finding your project slug.** On your iNaturalist project page, copy everything after `/projects/` in the URL.
 
-### Presentation
-- HTML version is best for interactive viewing
-- PowerPoint version allows manual editing and customization
-- Can add extra slides, annotations, or custom branding
+**Finding your coordinates.** Right-click your HQ in Google Maps and copy the numbers. Longitude is the first, latitude the second.
+
+**Event dates.** Use `as.Date("YYYY-MM-DD")`. For a multi-day event, set `date_min` to the first day and `date_max` to the last.
+
+### The title slide
+
+The title slide reads two settings near the top of the script:
+
+```r
+bioblitz_name <- "Walpole Wilderness Bioblitz"   # your bioblitz name
+bioblitz_year <- format(date_min, "%Y")           # auto from your event dates, or set e.g. "2025"
+```
+
+The text-only title slide then reads "Walpole Wilderness Bioblitz 2025", or your own name and year. If you supply a logo, the welcome slide uses the logo with the date range beneath it instead, so it is branded for your event either way. The map projection also derives from your HQ location, so the deck is not tied to the original Walpole run.
+
+---
+
+## Running the script
+
+**In RStudio.** Click **Source** at the top right, or press `Ctrl+Shift+S` (Windows and Linux) or `Cmd+Shift+S` (Mac). Progress prints to the console. Watch for the section markers and the final completion message.
+
+**From a terminal.**
+
+```bash
+Rscript Walpole_Bioblitz_Data_Dive_Slideshow_Script_V3.R
+```
+
+Run it from the script's folder so `bioblitz_style.R` and the relative output path resolve.
+
+**Timing.** The first run takes roughly 15 to 30 minutes: installing packages, downloading data, building the base map and OSM layers, and rendering more than a dozen figures. Later runs are much faster because observations, spatial layers and figures are cached.
+
+**Viewing.** Open `outputs/<project>_data_dive/slides/data_dive_presentation.html` in a browser. Press **F** for fullscreen, **Space** or the arrow keys to move, **S** for speaker view, **Esc** to exit. If you enabled PowerPoint, open the `.pptx` in PowerPoint or Google Slides.
+
+---
+
+## Configuration reference
+
+### Project and data
+
+| Parameter | Meaning | Default |
+|---|---|---|
+| `project_slug` | iNaturalist project identifier | (required) |
+| `bioblitz_name` | Name on the title slide | Walpole Wilderness Bioblitz |
+| `bioblitz_year` | Year on the title slide | from `date_min` |
+| `date_min` / `date_max` | Event window | 2025-10-04 / 2025-10-05 |
+| `hq_lon` / `hq_lat` | Headquarters coordinates | 116.634398 / -34.992854 |
+| `quality_grades` | Grades to include | c("research", "needs_id") |
+| `bioblitz_logo` | Logo file, or "" | Walpole-Wilderness-bioblitz.jpg |
+| `out_dir` | Output folder | outputs/..._data_dive |
+
+### Maps
+
+| Parameter | Meaning | Default |
+|---|---|---|
+| `base_map_zoom` | Satellite base map zoom (13 to 15) | 14 |
+| `buffer_km` | Map extent around observations (km) | 2.5 |
+
+The base map is satellite imagery. There is no `map_provider` setting in this version.
+
+### Run mode, caching and output
+
+| Parameter | Meaning | Default |
+|---|---|---|
+| `force_rebuild` | Regenerate all figures even if cached | TRUE |
+| `use_cached_data` | Reuse the cached observations | TRUE |
+| `render_html` | Render the reveal.js HTML deck | TRUE |
+| `render_powerpoint` | Render a PowerPoint | FALSE |
+
+### Slideshow playback (reveal.js)
+
+| Parameter | Meaning | Default |
+|---|---|---|
+| `auto_advance_ms` | Auto-advance time (ms, 0 disables) | 15000 |
+| `auto_slide_stoppable` | Let the viewer pause auto-advance | TRUE |
+| `slideshow_loop` | Loop at the end | TRUE |
+
+### Chart and slide sizing
+
+| Parameter | Meaning | Default |
+|---|---|---|
+| `fig2_use_treemap` | Treemap vs bar for taxa | TRUE |
+| `n_top_observers` | Observers shown | 15 |
+| `plot_title_size` / `plot_subtitle_size` | Chart title and subtitle (pt) | 34 / 22 |
+| `map_fig_width` / `map_fig_height` | Map figure size (in) | 15 / 10 |
+| `chart_fig_width` / `chart_fig_height` | Chart figure size (in) | 12 / 8 |
+| `legend_text_size` / `legend_title_size` | Legend text and title (pt) | 22 / 26 |
+| `axis_text_size` / `axis_title_size` | Axis text and title (pt) | 26 / 30 |
+| `chart_base_size` | Base font for the chart theme (pt) | 28 |
+| `legend_ncol` | Legend columns on taxa maps | 2 |
+| `slide_title_size` / `slide_subtitle_size` | Slide heading and subheading (px) | 88 / 44 |
+
+### Richness heatmaps
+
+| Parameter | Meaning | Default |
+|---|---|---|
+| `grid_cell_size_m` | Grid resolution (m) | 500 |
+| `rank_level` | Taxonomic rank to count | species |
+| `min_obs_per_cell` | Minimum observations per cell (effort-corrected) | 3 |
+| `warn_obs_per_cell` | Threshold for "Good" vs "Fair" quality | 10 |
+| `use_interpolation` | Build the smooth IDW surface | TRUE |
+| `interp_buffer_m` | Local richness buffer around each point (m) | 250 |
+| `interp_resolution` | Interpolation grid resolution (m) | 50 |
+| `idw_power` | IDW power parameter | 2 |
+| `mask_distance_m` | Maximum distance from observations to show (m) | 300 |
+
+### Rarefaction
+
+| Parameter | Meaning | Default |
+|---|---|---|
+| `n_permutations` | Random orderings for the curve | 100 |
+| `step_size` | Sample every N observations | 10 |
+| `rarefaction_rank_level` | Rank for accumulation | species |
+| `min_obs_reliable` | Threshold for a "Reliable" designation | 200 |
+| `min_obs_warning` | Warn below this many observations | 100 |
+
+---
+
+## The figures explained
+
+### Effort and summary
+
+- **Summary with photos** (`fig_summary_with_photos.png`). Headline counts: observations, species, observers and quality grades, with a photo collage.
+- **Top observers** (`fig_top_observers.png`). The biggest contributors, up to `n_top_observers`.
+- **Chart collage** (`fig_chart_collage.png`). A montage of the key charts for a single overview slide.
+
+### Spatial
+
+- **Observation hotspots** (`fig_observation_hotspots_jittered.png`, and `fig_observation_hotspots_no_plants.png`). Where observations fell, jittered to reduce overplotting, coloured by taxon. The second view drops plants, which often dominate, so animal patterns are easier to see.
+- **Species richness heatmaps.** Three complementary views:
+  - **Raw** (`fig_richness_raw.png`): total species per grid cell, an absolute view of hotspots.
+  - **Effort-corrected** (`fig_richness_effort_corrected.png`): species per observation, which accounts for uneven sampling. Only cells with at least `min_obs_per_cell` observations are shown.
+  - **Interpolated** (`fig_richness_interpolated.png`): a smooth IDW surface, masked to within `mask_distance_m` of the data so it does not extrapolate into unsampled ground.
+
+### Temporal
+
+- **Observations by hour** (`fig_observations_by_hour.png`, and `fig_observations_by_hour_stacked.png`). Activity across the day, with night shaded using sunrise and sunset for your location. The stacked version splits each hour by taxon.
+
+### Taxonomic and species
+
+- **Observations by taxon** (`fig_observations_by_taxon.png`). A treemap (or bar chart) of the taxonomic mix.
+- **Species rank abundance** (`fig_species_rank_annotated.png`, and `fig_species_rank_annotated_no_plants.png`). The most-recorded species, ranked and annotated, with a plants-excluded view.
+- **Species tiers** (`fig_species_tiers.png`). A photo grid of representative species.
+
+### Sampling completeness
+
+- **Rarefaction curves** (`fig_rarefaction_all_taxa.png`, and `fig_rarefaction_by_group.png`). Species accumulation against effort, with confidence intervals from `n_permutations` orderings. A steep curve means many species remain unfound; a flattening curve means most were captured. The by-group version compares taxa.
+
+### Environmental module
+
+- **Distance to track** (`fig_env_distance_track.png`). How observations sit relative to tracks and paths, a proxy for where sampling effort was concentrated.
+- **Rank abundance** (`fig_env_rank_abundance.png`). An abundance-ordered view for the environmental context.
+
+---
+
+## Output files
+
+Everything is written under `outputs/<project>_data_dive/`:
+
+- `observations_filtered.csv` : the cached observations. Reused on later runs unless you turn caching off.
+- `slides/` : the generated deck and its assets.
+  - `data_dive_presentation.qmd` : the Quarto source.
+  - `data_dive_presentation.html` : the rendered reveal.js deck.
+  - `data_dive_presentation.pptx` : the PowerPoint, if you enabled it.
+  - `fig_*.png` : all the figures.
+  - `styles/custom.css` : the deck styling.
+- `*.gpkg` : cached OSM tracks and other spatial layers.
+
+### The HTML is not self-contained
+
+The rendered deck references its figures and CSS by relative path.
+
+- **Open `data_dive_presentation.html` from inside the `slides/` folder.** Moving it on its own breaks the figures.
+- **To share it, zip the whole `slides/` folder** so the figures and styling travel with it. Or enable and send the PowerPoint, which is a single portable file.
+
+---
+
+## Reruns and the figure cache
+
+Figures are cached as PNGs so reruns are quick. The trade-off is that a change will not appear until the cached image is refreshed.
+
+- To refresh **one** figure, delete its PNG (for example `fig_species_tiers.png`) and run again. Only that figure is rebuilt.
+- To refresh **everything**, set `force_rebuild <- TRUE`.
+- Observations are cached separately in `observations_filtered.csv`. Set `use_cached_data <- FALSE` to fetch fresh data from iNaturalist.
+
+The species tiers figure in particular is worth remembering here: if you adjust its photo-grid layout and the slide looks unchanged, delete `fig_species_tiers.png` before re-rendering so the new layout is picked up.
+
+---
+
+## Performance
+
+The slowest steps are the base map, the OSM layers and the interpolation. To speed a run up:
+
+- Lower `base_map_zoom` to 12 or 13, and reduce `buffer_km`, for fewer and smaller map tiles.
+- Set `use_interpolation <- FALSE` to skip the smooth richness surface.
+- Reduce `n_permutations` (try 50) for faster rarefaction, at the cost of slightly rougher confidence bands.
+- Raise `grid_cell_size_m` (try 750 or 1000) so the heatmaps have fewer cells to compute.
+- Keep `use_cached_data <- TRUE` after the first run so data is not re-fetched.
 
 ---
 
 ## Troubleshooting
 
-### "No observations found"
-- Check `project_slug` is correct
-- Verify `date_min` and `date_max` include your event
-- Ensure project has observations with photos
+### The run stops with a `bioblitz_style.R` not found error
 
-### "Map shows wrong area"
-- Verify `hq_lon` and `hq_lat` coordinates
-- Remember: longitude first, latitude second
-- Check if you accidentally swapped them
+Put `bioblitz_style.R` in the same folder as the script, and run from that folder so the relative `source()` resolves.
 
-### "Script is slow"
-- First run always takes longer (15-30 minutes normal)
-- Increase `grid_cell_size_m` for faster heatmap generation
-- Set `use_interpolation <- FALSE` to skip interpolation
-- Reduce `n_permutations` for faster rarefaction (try 50)
+### A figure did not update after a change
 
-### "Figures look wrong"
-- Delete specific figure PNG files to regenerate them
-- Set `force_rebuild <- TRUE` to regenerate everything
-- Check figure dimensions if text is cut off
+Figures are cached. Delete the specific PNG (for example `fig_species_tiers.png`) or set `force_rebuild <- TRUE`, then run again.
 
-### "Not enough data for heatmaps"
-- Reduce `min_obs_per_cell` to lower threshold
-- Increase `grid_cell_size_m` to larger cells
-- Some analyses require minimum observation density
+### Rendering fails
 
----
+Install Quarto (https://quarto.org/) and the `quarto` R package. You can render the deck by hand:
 
-## What Makes This Script Special
+```bash
+quarto render outputs/<project>_data_dive/slides/data_dive_presentation.qmd
+```
 
-### Comprehensive Analysis
-- Covers spatial, temporal, taxonomic, and effort dimensions
-- Publication-quality figures with proper legends and scales
-- Automated quality checks and data validation
+Add `--to pptx` for the PowerPoint.
 
-### Smart Caching
-- Remembers downloaded data between runs
-- Only regenerates figures when needed
-- Dramatically faster subsequent runs (2-5 minutes)
+### No observations found
 
-### Professional Output
-- Multiple output formats for different uses
-- Consistent styling and branding
-- Ready for immediate presentation
+Check the project slug is exact, and that `date_min` and `date_max` cover your event. Confirm the project has observations in the chosen quality grades.
 
-### Effort-Corrected Metrics
-- Accounts for uneven sampling effort
-- Shows species richness per observation
-- More accurate than raw species counts
+### Map shows the wrong area
 
-### Statistical Rigor
-- Rarefaction analysis with confidence intervals
-- Data quality thresholds
-- Clear visualization of uncertainty
+Verify `hq_lon` and `hq_lat`, and that you have not swapped longitude and latitude (longitude first).
+
+### Not enough data for heatmaps
+
+Lower `min_obs_per_cell` (try 2), or raise `grid_cell_size_m` (try 750 or 1000). Sparse data needs larger cells.
+
+### Package installation fails
+
+Update R and RStudio, then install the named package by hand with `install.packages("package_name")` and read the console for the specific error.
 
 ---
 
-## Technical Requirements
+## Tips and best practices
 
-### Required R Packages (installed automatically):
-- httr2, jsonlite - iNaturalist API
-- dplyr, tidyr, purrr - Data manipulation
-- ggplot2, sf - Visualization and mapping
-- maptiles, terra, osmdata - Map tiles and geographic data
-- quarto - Slideshow generation
-- officer - PowerPoint generation
-
-### System Requirements:
-- R version 4.0 or higher
-- RStudio (recommended)
-- ~500 MB free disk space per project
-- Internet connection for initial data download
+- **Test small first.** Point at a small project or a short date window to check your coordinates and settings before a full run.
+- **Check the HQ marker.** It is the quickest way to confirm your coordinates are the right way round.
+- **HTML for viewing, PowerPoint for editing.** Present from the HTML deck; enable the PowerPoint when you want to add slides or tweak wording by hand.
+- **Keep the caches.** They cut reruns from half an hour to a few minutes. Only clear them for a deliberate full refresh.
+- **Match the two decks.** Because both the Data Dive and the photo Slideshow load the same `bioblitz_style.R`, editing the palette once updates both.
 
 ---
 
-## Comparison with Slideshow Script
+## Companion: the photo Slideshow deck
 
-The Data Dive script is complementary to the Slideshow Generator:
+This Data Dive pairs with the [iNaturalist Bioblitz Slideshow Generator](https://github.com/ollybolly/iNaturalist_Bioblitz_photo_presentations), which builds a photo-and-map slideshow from the same project and shares the same style file.
 
-**Slideshow Generator:**
-- Beautiful photo presentation
-- Random selection for variety
-- Event display and outreach
-- Auto-advancing slides
+| | Data Dive | Photo Slideshow |
+|---|---|---|
+| Purpose | Analysis and reporting | Visual celebration |
+| Output | Charts, maps, statistics | Photo slideshow |
+| Format | HTML and PowerPoint | HTML |
+| Best for | Wrap-up reports, insights | Event displays, outreach |
 
-**Data Dive Script:**
-- Comprehensive analysis
-- Statistical summaries
-- Scientific visualizations
-- Research and reporting
-
-**Use both!** The slideshow for public display, the data dive for analysis and reporting.
+Use both: the slideshow for public display, the data dive for the numbers behind it.
 
 ---
 
-## Credits
-
-This script was originally developed for the Walpole Wilderness Bioblitz 2025 and has been generalized to work with any iNaturalist bioblitz project worldwide.
-
-**Technologies used:**
-- R and RStudio
-- Quarto for slideshow generation
-- Reveal.js for HTML presentations
-- officer package for PowerPoint generation
-- iNaturalist API
-- OpenStreetMap and Esri map tiles
+**Happy analysing.** 📊🔬🌿
 
 ---
 
-**Happy Analyzing! 📊🔬🌿**
-
-If you create cool analyses with this script, consider sharing them back with the iNaturalist community!
+*Version 3*
