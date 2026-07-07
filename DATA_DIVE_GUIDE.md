@@ -1,7 +1,7 @@
 # iNaturalist Bioblitz Data Dive
 ## Complete Guide
 
-**Version 3**
+**Version 4**
 
 ---
 
@@ -15,38 +15,42 @@
 6. [Running the script](#running-the-script)
 7. [Configuration reference](#configuration-reference)
 8. [The figures explained](#the-figures-explained)
-9. [Output files](#output-files)
-10. [Reruns and the figure cache](#reruns-and-the-figure-cache)
-11. [Performance](#performance)
-12. [Troubleshooting](#troubleshooting)
-13. [Tips and best practices](#tips-and-best-practices)
-14. [Companion: the photo Slideshow deck](#companion-the-photo-slideshow-deck)
+9. [Contributor awards](#contributor-awards)
+10. [Output files](#output-files)
+11. [Reruns and the caches](#reruns-and-the-caches)
+12. [Performance](#performance)
+13. [Troubleshooting](#troubleshooting)
+14. [Tips and best practices](#tips-and-best-practices)
+15. [Companion: the photo Slideshow deck](#companion-the-photo-slideshow-deck)
 
 ---
 
 ## Introduction
 
-The Data Dive script builds an analytical presentation from an iNaturalist bioblitz project. It fetches your observations, produces a set of charts, maps and spatial analyses, and assembles them into a Quarto reveal.js deck, with an optional PowerPoint. It works for any project once you set a few values at the top of the script.
+The Data Dive script builds an analytical presentation from an iNaturalist bioblitz project. It fetches your observations, produces a set of charts, maps, spatial analyses and contributor awards, and assembles them into a Quarto reveal.js deck, with an optional PowerPoint. It works for any project once you set a few values at the top of the script.
 
 It is the analytical companion to the photo Slideshow deck. Where the Slideshow celebrates individual finds, the Data Dive tells the quantitative story: how much was recorded, by whom, where, when, and how completely.
 
-**What changed in version 3**
+**What changed in version 4**
 
-- The script now loads the shared `bioblitz_style.R` for the palette and PhyloPic taxon icons, so its colours and icons match the photo deck. That file must sit next to the script.
-- Maps use a satellite base map controlled by `base_map_zoom` and `buffer_km`. The old `map_provider` option is gone.
-- Rendering is done by Quarto (HTML and PowerPoint both come from `quarto::quarto_render`). PowerPoint is off by default.
-- New figures were added: species tiers, species rank abundance (with a plants-excluded view), an environmental module (distance to track and rank abundance), stacked observations by hour, and a chart collage.
-- Reveal.js playback settings were added (`auto_advance_ms`, `auto_slide_stoppable`, `slideshow_loop`).
-- The title slide and the map projection now build from your settings and HQ location, so the deck rebrands and reprojects itself for any bioblitz.
+- **Contributor awards.** A new section builds top-three podium slides (gold, silver, bronze) for a roster of categories, each with the observer's profile photo. See [Contributor awards](#contributor-awards).
+- **Hotspot close-ups.** The script now finds the densest observation clusters and renders zoom-in slides for them, captioned with the window size and observation count.
+- **A persistent map cache.** Satellite tiles now cache to `base_map_cache/` and survive figure rebuilds, so rebuilding the slides no longer re-downloads them. New flags `force_refetch_maps` and `force_refetch_photos` let you force a refresh when the data has actually changed.
+- **Named OSM caches.** The road, track and water layers cache to `osm_roads.gpkg`, `osm_tracks.gpkg` and `osm_water.gpkg`, with `.none` marker files for layers that returned nothing.
+- **PowerPoint restyle.** When you render a PowerPoint, an embedded Python step restyles it to full-bleed navy so it matches the HTML. It needs `python-pptx` and is skipped gracefully if that is absent.
+- **Photo caching and variety.** Species, observer and award photos cache under `slides/`. `vary_summary_photos` controls whether the summary border reshuffles between runs or stays reproducible.
+
+Everything from version 3 carries over: the shared `bioblitz_style.R` palette and PhyloPic icons, the satellite base map, Quarto rendering, the expanded figure set, the reveal.js playback settings, and the self-rebranding title slide and map projection.
 
 ---
 
 ## What the script produces
 
-Working from your project data, the script generates these analyses. Each becomes a figure in the deck (see [The figures explained](#the-figures-explained)):
+Working from your project data, the script generates these analyses. Each becomes a figure or a slide in the deck (see [The figures explained](#the-figures-explained)):
 
 - Headline summary with a photo collage.
 - Observation hotspots (all taxa, and a plants-excluded view).
+- Hotspot close-ups on the densest clusters.
 - Taxonomic breakdown as a treemap or bar chart.
 - Top observers.
 - Activity by hour of day, with day and night shaded, and a stacked-by-taxon view.
@@ -55,6 +59,7 @@ Working from your project data, the script generates these analyses. Each become
 - Species rank abundance, annotated, with a plants-excluded view.
 - A species tiers photo grid.
 - An environmental module: distance to track and rank abundance.
+- Contributor awards, one podium slide per category.
 - A chart collage.
 
 Outputs are a reveal.js HTML deck and, optionally, a PowerPoint.
@@ -67,7 +72,8 @@ Outputs are a reveal.js HTML deck and, optionally, a PowerPoint.
 
 1. **R** 4.0 or newer. https://cran.r-project.org/
 2. **RStudio Desktop.** https://posit.co/download/rstudio-desktop/
-3. **Quarto.** https://quarto.org/ Needed to render the deck. RStudio ships with a copy; if rendering fails, install Quarto and the `quarto` R package.
+3. **Quarto.** https://quarto.org/ Needed to render the deck. RStudio ships with a copy. The script also needs the `quarto` R package, which it does **not** install for you, so run `install.packages("quarto")` once if rendering reports it is missing.
+4. **Optional: Python 3 with `python-pptx`.** Used only to restyle the PowerPoint to full-bleed navy. Install with `pip install python-pptx`. Without it, the PowerPoint still renders, just without the restyle.
 
 ### R packages (installed automatically on first run)
 
@@ -76,9 +82,8 @@ Outputs are a reveal.js HTML deck and, optionally, a PowerPoint.
 - **Plotting:** `ggplot2`, `scales`, `viridis`, `patchwork`, `cowplot`, `treemapify`, `ggimage`, `magick`, `rsvg`
 - **Analysis:** `suncalc`
 - **Palette and taxon icons:** `wesanderson`, `ggtext`, `rphylopic`, `png`
-- **Rendering:** `quarto`
 
-First-time installation can take 15 to 20 minutes.
+The `quarto` R package is handled separately and is not in the auto-install list, so install it by hand if the render step reports it missing. First-time installation of the rest can take 15 to 20 minutes.
 
 ### Your bioblitz information
 
@@ -91,7 +96,7 @@ First-time installation can take 15 to 20 minutes.
 
 ## The companion style file
 
-Version 3 loads `bioblitz_style.R` on startup for the shared Wes Anderson palette and the PhyloPic taxon-icon helpers. **It must be in the same folder as the script.**
+The script loads `bioblitz_style.R` on startup for the shared Wes Anderson palette and the PhyloPic taxon-icon helpers. **It must be in the same folder as the script.**
 
 If you ever see an error about `bioblitz_style.R` not being found, this is the cause. Put the file next to the script and run from that folder.
 
@@ -123,7 +128,7 @@ The taxon colours come from the `taxon_cols` vector at the top of `bioblitz_styl
 
 ## Setup and configuration
 
-Open the script in RStudio and set the working directory to its folder (Session, Set Working Directory, To Source File Location). Then edit the settings near the top.
+Open the script in RStudio and set the working directory to its folder (Session, Set Working Directory, To Source File Location). When run in RStudio the script also anchors the working directory to its own location, so the relative `source()` and output paths resolve either way. Then edit the settings near the top.
 
 ### Essential settings
 
@@ -136,8 +141,9 @@ hq_lon         <- 116.634398                     # headquarters longitude
 hq_lat         <- -34.992854                     # headquarters latitude
 bioblitz_logo  <- "your-logo.jpg"                # same folder, or "" for none
 quality_grades <- c("research", "needs_id")      # observation grades to include
-out_dir        <- "outputs/your_project_data_dive"
 ```
+
+The output folder is derived from `project_slug`, so you do not set it by hand and different bioblitzes never share a cache.
 
 **Finding your project slug.** On your iNaturalist project page, copy everything after `/projects/` in the URL.
 
@@ -170,9 +176,9 @@ Rscript Walpole_Bioblitz_Data_Dive_Slideshow_Script_V3.R
 
 Run it from the script's folder so `bioblitz_style.R` and the relative output path resolve.
 
-**Timing.** The first run takes roughly 15 to 30 minutes: installing packages, downloading data, building the base map and OSM layers, and rendering more than a dozen figures. Later runs are much faster because observations, spatial layers and figures are cached.
+**Timing.** The first run takes roughly 15 to 30 minutes: installing packages, downloading data and photos, building the base map and OSM layers, and rendering the figures, close-ups and award podiums. Later runs are much faster because observations, spatial layers, photos and figures are all cached.
 
-**Viewing.** Open `outputs/<project>_data_dive/slides/data_dive_presentation.html` in a browser. Press **F** for fullscreen, **Space** or the arrow keys to move, **S** for speaker view, **Esc** to exit. If you enabled PowerPoint, open the `.pptx` in PowerPoint or Google Slides.
+**Viewing.** Open `outputs/<project>_data_dive/slides/data_dive_presentation.html` in a browser. Press **F** for fullscreen, **Space** or the arrow keys to move, **S** for speaker view, **A** to pause auto-advance, **Esc** to exit. If you enabled PowerPoint, open the `.pptx` in PowerPoint or Google Slides.
 
 ---
 
@@ -189,7 +195,8 @@ Run it from the script's folder so `bioblitz_style.R` and the relative output pa
 | `hq_lon` / `hq_lat` | Headquarters coordinates | 116.634398 / -34.992854 |
 | `quality_grades` | Grades to include | c("research", "needs_id") |
 | `bioblitz_logo` | Logo file, or "" | Walpole-Wilderness-bioblitz.jpg |
-| `out_dir` | Output folder | outputs/..._data_dive |
+
+The output folder is derived from `project_slug` and is not set directly.
 
 ### Maps
 
@@ -198,7 +205,7 @@ Run it from the script's folder so `bioblitz_style.R` and the relative output pa
 | `base_map_zoom` | Satellite base map zoom (13 to 15) | 14 |
 | `buffer_km` | Map extent around observations (km) | 2.5 |
 
-The base map is satellite imagery. There is no `map_provider` setting in this version.
+The base map is Esri satellite imagery. There is no `map_provider` setting in this version.
 
 ### Run mode, caching and output
 
@@ -206,8 +213,13 @@ The base map is satellite imagery. There is no `map_provider` setting in this ve
 |---|---|---|
 | `force_rebuild` | Regenerate all figures even if cached | TRUE |
 | `use_cached_data` | Reuse the cached observations | TRUE |
+| `force_refetch_maps` | Re-download satellite tiles and OSM layers | FALSE |
+| `force_refetch_photos` | Re-download species, observer and award photos | FALSE |
+| `vary_summary_photos` | Reshuffle the summary border photos each run | TRUE |
 | `render_html` | Render the reveal.js HTML deck | TRUE |
 | `render_powerpoint` | Render a PowerPoint | FALSE |
+
+`force_refetch_maps` and `force_refetch_photos` are independent of `force_rebuild`, so a figure rebuild reuses the cached tiles and photos unless you turn these on. Set `vary_summary_photos <- FALSE` for a fixed, reproducible border (seed 123).
 
 ### Slideshow playback (reveal.js)
 
@@ -256,19 +268,42 @@ The base map is satellite imagery. There is no `map_provider` setting in this ve
 | `min_obs_reliable` | Threshold for a "Reliable" designation | 200 |
 | `min_obs_warning` | Warn below this many observations | 100 |
 
+### Hotspot close-ups
+
+These live in the Figure 1C block, not the top configuration:
+
+| Parameter | Meaning | Default |
+|---|---|---|
+| `zoom_enable` | Build the hotspot close-ups | TRUE |
+| `zoom_window_m` | Close-up window side length (m) | 800 |
+| `n_zooms` | How many close-ups to show | 3 |
+| `zoom_min_sep_m` | Minimum spacing between chosen windows (m) | 1200 |
+| `zoom_min_obs` | Minimum observations in a window to qualify | 20 |
+
+### Contributor awards
+
+These live in the awards block near the end of the script:
+
+| Parameter | Meaning | Default |
+|---|---|---|
+| `include_awards` | Build the awards section | TRUE |
+| `award_min_obs` | Minimum observations to be eligible | 5 |
+| `award_ids` | Which award categories to include | all defined |
+
 ---
 
 ## The figures explained
 
 ### Effort and summary
 
-- **Summary with photos** (`fig_summary_with_photos.png`). Headline counts: observations, species, observers and quality grades, with a photo collage.
+- **Summary with photos** (`fig_summary_with_photos.png`). Headline counts: observations, species, observers and quality grades, with a photo collage border. `vary_summary_photos` controls whether the border photos reshuffle between runs.
 - **Top observers** (`fig_top_observers.png`). The biggest contributors, up to `n_top_observers`.
 - **Chart collage** (`fig_chart_collage.png`). A montage of the key charts for a single overview slide.
 
 ### Spatial
 
 - **Observation hotspots** (`fig_observation_hotspots_jittered.png`, and `fig_observation_hotspots_no_plants.png`). Where observations fell, jittered to reduce overplotting, coloured by taxon. The second view drops plants, which often dominate, so animal patterns are easier to see.
+- **Hotspot close-ups** (`fig_zoom_1.png`, `fig_zoom_2.png`, ...). The script grids the observations, picks the densest windows (kept `zoom_min_sep_m` apart so they are distinct hotspots), and renders a high-zoom satellite close-up of each, captioned with its window size and observation count. Controlled by the settings in the Figure 1C block.
 - **Species richness heatmaps.** Three complementary views:
   - **Raw** (`fig_richness_raw.png`): total species per grid cell, an absolute view of hotspots.
   - **Effort-corrected** (`fig_richness_effort_corrected.png`): species per observation, which accounts for uneven sampling. Only cells with at least `min_obs_per_cell` observations are shown.
@@ -295,18 +330,50 @@ The base map is satellite imagery. There is no `map_provider` setting in this ve
 
 ---
 
+## Contributor awards
+
+The awards section (set `include_awards <- TRUE`) builds a podium slide for each category that has data. Each slide shows the top three contributors as a gold, silver and bronze podium, with the observer's iNaturalist profile photo (or a random taxon silhouette if they have none). A contributor must have at least `award_min_obs` observations to be eligible. The podium PNGs are saved as `award_<id>.png` in the `slides/` folder, and profile photos cache under `slides/award_photos/`.
+
+The standard categories are:
+
+- **Most Observations** : the biggest contributors overall.
+- **Most Diverse** : the most different species recorded.
+- **Jack of All Trades** : recorded across the most groups of life.
+- **The Specialist** : the highest share of records in one group.
+- **The Completist** : the most records of a single species.
+- **The Explorer** : the observation furthest from HQ.
+- **Ground Covered** : the widest spread of observations.
+- **Night Owl** : the most observations after dark.
+- **Early Bird** : the most observations around dawn.
+- **Power Hour** : the most observations in one half-hour.
+- **Rarest Finds** : the most conservation-listed species.
+- **The Marathon** : the most observations in a single day.
+- **Gold Standard** : the most research-grade observations.
+
+On top of these, a per-group **champion** award is added for each iconic taxon present in the data, for example Most Plants, Most Birds, Most Insects, Most Spiders, Most Fungi, Most Molluscs, Most Reptiles, Most Amphibians, Most Mammals and Most Fish. Groups with no records are skipped.
+
+To trim the list once you have picked favourites, edit `award_ids` (it defaults to every category defined). To drop the section entirely, set `include_awards <- FALSE`.
+
+---
+
 ## Output files
 
 Everything is written under `outputs/<project>_data_dive/`:
 
 - `observations_filtered.csv` : the cached observations. Reused on later runs unless you turn caching off.
+- `base_map_cache/` : cached satellite tiles. Survives figure rebuilds; refreshed only when `force_refetch_maps` is TRUE.
+- `osm_roads.gpkg`, `osm_tracks.gpkg`, `osm_water.gpkg` : cached OSM layers. A matching `.none` marker means that layer returned nothing for your area.
 - `slides/` : the generated deck and its assets.
   - `data_dive_presentation.qmd` : the Quarto source.
   - `data_dive_presentation.html` : the rendered reveal.js deck.
   - `data_dive_presentation.pptx` : the PowerPoint, if you enabled it.
-  - `fig_*.png` : all the figures.
+  - `summary.csv` : the headline counts, saved for reference.
+  - `fig_*.png` : the figures.
+  - `fig_zoom_*.png` : the hotspot close-ups.
+  - `award_*.png` : the contributor award podiums.
+  - `species_photos/` : cached species and observer photos.
+  - `award_photos/` : cached observer profile photos for the podiums.
   - `styles/custom.css` : the deck styling.
-- `*.gpkg` : cached OSM tracks and other spatial layers.
 
 ### The HTML is not self-contained
 
@@ -317,26 +384,29 @@ The rendered deck references its figures and CSS by relative path.
 
 ---
 
-## Reruns and the figure cache
+## Reruns and the caches
 
-Figures are cached as PNGs so reruns are quick. The trade-off is that a change will not appear until the cached image is refreshed.
+Several layers are cached so reruns are quick. The trade-off is that a change will not appear until the relevant cache is refreshed.
 
-- To refresh **one** figure, delete its PNG (for example `fig_species_tiers.png`) and run again. Only that figure is rebuilt.
-- To refresh **everything**, set `force_rebuild <- TRUE`.
-- Observations are cached separately in `observations_filtered.csv`. Set `use_cached_data <- FALSE` to fetch fresh data from iNaturalist.
+- **Figures** are cached as PNGs. To refresh **one**, delete its PNG (for example `fig_species_tiers.png`) and run again. To refresh **everything**, set `force_rebuild <- TRUE`.
+- **Observations** are cached in `observations_filtered.csv`. Set `use_cached_data <- FALSE` to fetch fresh data from iNaturalist.
+- **Satellite tiles and OSM layers** cache under `base_map_cache/` and the `osm_*.gpkg` files, and are reused even during a full figure rebuild. Set `force_refetch_maps <- TRUE` for one run when the map area or the OSM data has actually changed.
+- **Photos** (species, observer and award) cache under `slides/`. Set `force_refetch_photos <- TRUE` to re-download them.
 
-The species tiers figure in particular is worth remembering here: if you adjust its photo-grid layout and the slide looks unchanged, delete `fig_species_tiers.png` before re-rendering so the new layout is picked up.
+The species tiers figure is worth remembering here: if you adjust its photo-grid layout and the slide looks unchanged, delete `fig_species_tiers.png` before re-rendering so the new layout is picked up. The same applies to award podiums (`award_*.png`) and close-ups (`fig_zoom_*.png`).
 
 ---
 
 ## Performance
 
-The slowest steps are the base map, the OSM layers and the interpolation. To speed a run up:
+The slowest steps are the base map, the OSM layers, the photo downloads and the interpolation. To speed a run up:
 
 - Lower `base_map_zoom` to 12 or 13, and reduce `buffer_km`, for fewer and smaller map tiles.
+- Keep `force_refetch_maps` and `force_refetch_photos` at FALSE so tiles and photos are reused.
 - Set `use_interpolation <- FALSE` to skip the smooth richness surface.
 - Reduce `n_permutations` (try 50) for faster rarefaction, at the cost of slightly rougher confidence bands.
 - Raise `grid_cell_size_m` (try 750 or 1000) so the heatmaps have fewer cells to compute.
+- Set `include_awards <- FALSE`, or trim `award_ids`, to skip building award podiums.
 - Keep `use_cached_data <- TRUE` after the first run so data is not re-fetched.
 
 ---
@@ -349,17 +419,33 @@ Put `bioblitz_style.R` in the same folder as the script, and run from that folde
 
 ### A figure did not update after a change
 
-Figures are cached. Delete the specific PNG (for example `fig_species_tiers.png`) or set `force_rebuild <- TRUE`, then run again.
+Figures are cached. Delete the specific PNG (for example `fig_species_tiers.png`, `award_most_obs.png`, or `fig_zoom_1.png`) or set `force_rebuild <- TRUE`, then run again.
 
 ### Rendering fails
 
-Install Quarto (https://quarto.org/) and the `quarto` R package. You can render the deck by hand:
+Install Quarto (https://quarto.org/) and the `quarto` R package (`install.packages("quarto")`). You can render the deck by hand:
 
 ```bash
 quarto render outputs/<project>_data_dive/slides/data_dive_presentation.qmd
 ```
 
 Add `--to pptx` for the PowerPoint.
+
+### The map or photos look stale after new observations arrive
+
+The tiles, OSM layers and photos are cached and reused across figure rebuilds. Set `force_refetch_maps <- TRUE` and `force_refetch_photos <- TRUE` for one run, then set them back to FALSE.
+
+### No award slides appeared
+
+Confirm `include_awards <- TRUE`, and that enough observers cleared `award_min_obs`. Any category with no qualifying data is skipped silently. If you edited `award_ids`, check the ones you want are still listed.
+
+### No hotspot close-ups appeared
+
+The console prints "No qualifying hotspot windows" when nothing meets the thresholds. Lower `zoom_min_obs`, or reduce `zoom_min_sep_m`, in the Figure 1C block. Sparse events may simply not have dense enough clusters.
+
+### The PowerPoint is not navy full-bleed
+
+The restyle needs Python 3 and `python-pptx` (`pip install python-pptx`). The console notes when it is skipped. The deck still renders correctly without it.
 
 ### No observations found
 
@@ -383,8 +469,9 @@ Update R and RStudio, then install the named package by hand with `install.packa
 
 - **Test small first.** Point at a small project or a short date window to check your coordinates and settings before a full run.
 - **Check the HQ marker.** It is the quickest way to confirm your coordinates are the right way round.
+- **Pick your awards.** Run once with all categories, then trim `award_ids` to the ones that tell the best story for your event.
 - **HTML for viewing, PowerPoint for editing.** Present from the HTML deck; enable the PowerPoint when you want to add slides or tweak wording by hand.
-- **Keep the caches.** They cut reruns from half an hour to a few minutes. Only clear them for a deliberate full refresh.
+- **Keep the caches.** They cut reruns from half an hour to a few minutes. Only clear them, or set the `force_refetch_*` flags, for a deliberate refresh.
 - **Match the two decks.** Because both the Data Dive and the photo Slideshow load the same `bioblitz_style.R`, editing the palette once updates both.
 
 ---
@@ -396,7 +483,7 @@ This Data Dive pairs with the [iNaturalist Bioblitz Slideshow Generator](https:/
 | | Data Dive | Photo Slideshow |
 |---|---|---|
 | Purpose | Analysis and reporting | Visual celebration |
-| Output | Charts, maps, statistics | Photo slideshow |
+| Output | Charts, maps, statistics, awards | Photo slideshow |
 | Format | HTML and PowerPoint | HTML |
 | Best for | Wrap-up reports, insights | Event displays, outreach |
 
@@ -408,4 +495,4 @@ Use both: the slideshow for public display, the data dive for the numbers behind
 
 ---
 
-*Version 3*
+*Version 4*
