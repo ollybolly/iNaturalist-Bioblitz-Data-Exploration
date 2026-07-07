@@ -10,6 +10,12 @@
 
 cat("=== DATA DIVE SCRIPT STARTING ===\n\n")
 
+# If run in RStudio, anchor the working directory to THIS script's folder so that
+# bioblitz_style.R and the relative output paths resolve regardless of where R started.
+try(if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable())
+      setwd(dirname(rstudioapi::getSourceEditorContext()$path)), silent = TRUE)
+cat("Working directory:", getwd(), "\n")
+
 # ==============================================================================
 # CONFIGURATION - EDIT THESE SETTINGS
 # ==============================================================================
@@ -35,17 +41,33 @@ bioblitz_name <- "Walpole Wilderness Bioblitz"   # Your bioblitz name, as it sho
 bioblitz_year <- format(date_min, "%Y")           # Auto-filled from your event dates; or set manually, e.g. "2025"
 
 # --- Output Settings ---
-out_dir <- "outputs/walpole_wilderness_bioblitz_2025_data_dive"
+# Derived from project_slug so each bioblitz gets its own cache + outputs; running
+# different bioblitzes sequentially will not cross-contaminate obs/OSM/figures.
+out_dir <- file.path("outputs", paste0(gsub("[^a-z0-9]+", "_", tolower(project_slug)), "_data_dive"))
 slides_dir <- file.path(out_dir, "slides")
 styles_dir <- file.path(slides_dir, "styles")   # must sit beside the qmd so the css: link resolves
+base_map_dir <- file.path(out_dir, "base_map_cache")  # persistent satellite-tile + OSM cache (survives figure rebuilds)
 
 # --- Map Settings ---
 base_map_zoom <- 14    # Zoom level for satellite imagery (higher = more detail)
 buffer_km <- 2.5       # Buffer around observations in kilometers for map extent (optimized for tighter framing)
 
 # --- Force rebuild ---
-force_rebuild <- TRUE     # Set TRUE to regenerate all figures even if cached
+force_rebuild <- TRUE      # Set TRUE to regenerate all figures even if cached (revert to FALSE after a full run)
 use_cached_data <- TRUE    # Set FALSE to fetch fresh data from iNaturalist
+
+# --- Map caching ---
+# Satellite tiles and OSM overlays are expensive network fetches. They are
+# cached on disk under base_map_cache/ and reused even when force_rebuild
+# rebuilds the figures, so a slide rebuild does not re-download them. Set this
+# TRUE only when the map area or the OSM data has actually changed.
+force_refetch_maps <- FALSE
+force_refetch_photos <- FALSE  # TRUE = re-download species/observer/showcase photos.
+                               # Leave FALSE to reuse cached photos even when
+                               # force_rebuild rebuilds the figures.
+vary_summary_photos  <- TRUE   # TRUE = vary the slide-2 border photos between runs
+                               #        (fresh species sample + shuffled order);
+                               #        FALSE = fixed/reproducible (seed 123).
 
 # --- Output Format Options ---
 render_html <- TRUE        # Generate HTML slideshow (revealjs)
@@ -192,6 +214,7 @@ cat("Project:", project_slug, "\n")
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(slides_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(styles_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(base_map_dir, recursive = TRUE, showWarnings = FALSE)
 
 Sys.setenv(TZ = "Australia/Perth")
 
@@ -409,6 +432,10 @@ if (use_cached_data && file.exists(obs_cache_file)) {
   cat("Saved observations to cache\n\n")
 }
 
+# Guarantee the timestamp column exists so the hourly plots and time-based awards
+# never error on a missing column (older caches or sparse records may lack it).
+if (!("time_observed_at" %in% names(obs))) obs$time_observed_at <- as.POSIXct(NA)
+
 # ==============================================================================
 # STYLING
 # ==============================================================================
@@ -417,6 +444,10 @@ cat("=== SETTING UP STYLING ===\n")
 
 # Taxon palette + silhouette icons now come from the shared style file
 # (Wes Anderson palette; PhyloPic silhouettes shared with the slideshow).
+if (!file.exists("bioblitz_style.R"))
+  stop("Cannot find bioblitz_style.R in the working directory:\n  ", getwd(),
+       "\nSet the working directory to the folder that holds this script AND bioblitz_style.R,"
+       , "\nthen re-run. In RStudio: Session > Set Working Directory > To Source File Location.")
 source("bioblitz_style.R")
 
 # Custom theme matching slideshow aesthetic (for figures 4 & 5)
@@ -459,7 +490,7 @@ base_theme <- ggplot2::theme_minimal(base_size = 14) +
 # ==============================================================================
 # SHARED SIDE-LEGEND / HQ / AXIS HELPERS (transferred from approved prototype)
 # ==============================================================================
-hq_layers <- function(bbox_buffered, hq_lon = 116.634398, hq_lat = -34.992854,
+hq_layers <- function(bbox_buffered, hq_lon, hq_lat,
                       hq_scale = 0.8, hq_label_size = 6) {
   bb_m  <- sf::st_bbox(sf::st_transform(sf::st_as_sfc(bbox_buffered), 3857))
   hq_w  <- as.numeric(bb_m["xmax"] - bb_m["xmin"])
@@ -483,15 +514,11 @@ hq_layers <- function(bbox_buffered, hq_lon = 116.634398, hq_lat = -34.992854,
     ring <- as.matrix(df[, c("x","y")]); ring <- rbind(ring, ring[1, ])
     sf::st_transform(sf::st_sfc(sf::st_polygon(list(ring)), crs = 3857), 4326)
   }
-  hq_lab <- sf::st_coordinates(sf::st_transform(
-    sf::st_sfc(sf::st_point(c(hq_px, hq_poletop)), crs = 3857), 4326))
   list(
     ggplot2::geom_sf(data = to_sf(hq_body), fill = "white", colour = NA, inherit.aes = FALSE),
     ggplot2::geom_sf(data = to_sf(hq_pole), fill = "white", colour = NA, inherit.aes = FALSE),
     ggplot2::geom_sf(data = to_sf(hq_roof), fill = "white", colour = NA, inherit.aes = FALSE),
-    ggplot2::geom_sf(data = to_sf(hq_flag), fill = "white", colour = NA, inherit.aes = FALSE),
-    ggplot2::annotate("text", x = hq_lab[1], y = hq_lab[2], label = "HQ",
-                      colour = "yellow", fontface = "bold", size = hq_label_size, vjust = -0.4)
+    ggplot2::geom_sf(data = to_sf(hq_flag), fill = "white", colour = NA, inherit.aes = FALSE)
   )
 }
 
@@ -512,7 +539,8 @@ axis_two_breaks <- function(bbox_buffered) {
 
 build_taxon_legend <- function(present, legend_ncol = 2, legend_icon_sz = 0.08,
                                legend_text_sz = 9, legend_colgap = 7.5,
-                               legend_lmar = 10, legend_rpad = 6.0, legend_lpad = -1.3) {
+                               legend_lmar = 10, legend_rpad = 6.0, legend_lpad = -1.3,
+                               show_hq = FALSE) {
   present <- c(setdiff(present, "Unknown"), if ("Unknown" %in% present) "Unknown")
   n <- length(present); nrows <- ceiling(n / legend_ncol)
   leg <- data.frame(taxon = present, idx = seq_len(n) - 1) |>
@@ -533,7 +561,12 @@ build_taxon_legend <- function(present, legend_ncol = 2, legend_icon_sz = 0.08,
     ggplot2::annotate("text", x = max(-1.0, legend_lpad + 0.1), y = nrows + 1.0, label = "Taxa",
                       hjust = 0, fontface = "bold", colour = "#F7FAFC", size = legend_text_sz + 2) +
     ggplot2::scale_x_continuous(limits = c(legend_lpad, (legend_ncol - 1) * legend_colgap + legend_rpad)) +
-    ggplot2::scale_y_continuous(limits = c(0.3, nrows + 1.5)) +
+    ggplot2::scale_y_continuous(limits = c(if (show_hq) -1.0 else 0.3, nrows + 1.5)) +
+    {if (show_hq && file.exists(hut_icon_path))
+       ggimage::geom_image(data = data.frame(x = 0, y = -0.35, img = hut_icon_path),
+                           ggplot2::aes(x = x, y = y, image = img), size = legend_icon_sz * 1.15, asp = 1)} +
+    {if (show_hq) ggplot2::annotate("text", x = 1.15, y = -0.35, label = "Bioblitz Headquarters",
+                                    hjust = 0, colour = "#F7FAFC", size = legend_text_sz)} +
     ggplot2::theme_void() +
     ggplot2::theme(plot.background  = ggplot2::element_rect(fill = "#040a11", colour = NA),
                    panel.background = ggplot2::element_rect(fill = "#040a11", colour = NA),
@@ -542,12 +575,14 @@ build_taxon_legend <- function(present, legend_ncol = 2, legend_icon_sz = 0.08,
 
 # Compose any legend-free plot beside the shared taxon legend into one 16:9 PNG.
 # map_frac = % width for the plot (54 for square maps; ~80 for wide charts).
-compose_with_legend <- function(p, present, path, map_frac = 54, w = 16, h = 9,
+compose_with_legend <- function(p, present, path, map_frac = 64, w = 16, h = 9,
                                 leg_icon = 0.08, leg_text = 9, leg_colgap = 7.5,
-                                leg_lmar = 10, leg_rpad = 6.0, leg_lpad = -1.3) {
+                                leg_lmar = 10, leg_rpad = 6.0, leg_lpad = -1.3,
+                                show_hq = FALSE) {
   p_leg <- build_taxon_legend(present, legend_icon_sz = leg_icon,
                               legend_text_sz = leg_text, legend_colgap = leg_colgap,
-                              legend_lmar = leg_lmar, legend_rpad = leg_rpad, legend_lpad = leg_lpad)
+                              legend_lmar = leg_lmar, legend_rpad = leg_rpad, legend_lpad = leg_lpad,
+                              show_hq = show_hq)
   combo <- patchwork::wrap_plots(p, p_leg, nrow = 1, widths = c(map_frac, 100 - map_frac)) &
     ggplot2::theme(plot.background = ggplot2::element_rect(fill = "#040a11", colour = NA))
   ggplot2::ggsave(path, combo, width = w, height = h, dpi = 150, bg = "#040a11")
@@ -603,12 +638,13 @@ if (!file.exists(summary_card_path) || force_rebuild) {
     dplyr::arrange(iconic_taxon, taxon_id)
   
   # Sample up to 12 diverse species (prefer different iconic taxa)
-  set.seed(123)  # For reproducibility
+  if (isTRUE(vary_summary_photos)) set.seed(NULL) else set.seed(123)  # NULL = fresh RNG each run
   species_sample <- obs_with_photos |>
     dplyr::group_by(iconic_taxon) |>
     dplyr::slice_sample(n = 2) |>
-    dplyr::ungroup() |>
-    dplyr::slice_head(n = 12)
+    dplyr::ungroup()
+  if (isTRUE(vary_summary_photos)) species_sample <- dplyr::slice_sample(species_sample, prop = 1)
+  species_sample <- dplyr::slice_head(species_sample, n = 12)
   
   # Get photo URLs from iNaturalist
   cat("Downloading species photos from iNaturalist...\n")
@@ -618,6 +654,12 @@ if (!file.exists(summary_card_path) || force_rebuild) {
   species_photos <- list()
   for (i in seq_len(nrow(species_sample))) {
     obs_id <- species_sample$obs_id[i]
+    photo_path <- file.path(species_photos_dir, paste0("species_obs_", obs_id, ".jpg"))
+    if (file.exists(photo_path) && !force_refetch_photos) {
+      species_photos[[length(species_photos) + 1]] <- photo_path
+      cat("  Using cached species photo", i, "\n")
+      next
+    }
     
     tryCatch({
       # Fetch observation details to get photo URL
@@ -629,7 +671,6 @@ if (!file.exists(summary_card_path) || force_rebuild) {
         photo_url <- gsub("/square\\.", "/medium.", photo_url)
         
         # Download photo
-        photo_path <- file.path(species_photos_dir, paste0("species_", i, ".jpg"))
         resp <- httr2::request(photo_url) |>
           httr2::req_user_agent("walpole-bioblitz-datadive") |>
           httr2::req_perform()
@@ -650,11 +691,13 @@ if (!file.exists(summary_card_path) || force_rebuild) {
   
   # Get observer profile photos (top 8 observers)
   cat("Selecting observer profile photos...\n")
-  top_observers_for_border <- obs |>
+  observer_pool <- obs |>
     dplyr::count(observer_login, observer_name, observer_icon_url) |>
-    dplyr::arrange(dplyr::desc(n)) |>
-    dplyr::slice_head(n = 8) |>
-    dplyr::filter(!is.na(observer_icon_url), observer_icon_url != "")
+    dplyr::filter(!is.na(observer_icon_url), observer_icon_url != "") |>
+    dplyr::arrange(dplyr::desc(n))
+  top_observers_for_border <- if (isTRUE(vary_summary_photos))
+    dplyr::slice_sample(dplyr::slice_head(observer_pool, n = 16), n = min(8, nrow(observer_pool)))
+  else dplyr::slice_head(observer_pool, n = 8)
   
   observer_photos <- list()
   for (i in seq_len(nrow(top_observers_for_border))) {
@@ -677,6 +720,7 @@ if (!file.exists(summary_card_path) || force_rebuild) {
   
   # Combine all photos for border
   all_border_photos <- c(species_photos, observer_photos)
+  if (isTRUE(vary_summary_photos)) all_border_photos <- all_border_photos[sample(length(all_border_photos))]
   
   if (length(all_border_photos) > 0) {
     cat("Creating summary card with photo border...\n")
@@ -687,13 +731,13 @@ if (!file.exists(summary_card_path) || force_rebuild) {
     canvas <- magick::image_blank(card_width, card_height, color = "#040a11")
     
     # Photo border settings
-    thumb_size <- 120
+    thumb_size <- 240
     border_padding <- 20
     
     # Calculate positions for photos around the border
     # Top edge
     top_positions <- list()
-    n_top <- min(ceiling(length(all_border_photos) * 0.4), 8)
+    n_top <- min(ceiling(length(all_border_photos) * 0.4), 6)
     if (n_top > 0) {
       spacing_x <- (card_width - 2 * border_padding) / (n_top + 1)
       for (i in 1:n_top) {
@@ -703,7 +747,7 @@ if (!file.exists(summary_card_path) || force_rebuild) {
     
     # Bottom edge  
     bottom_positions <- list()
-    n_bottom <- min(ceiling(length(all_border_photos) * 0.4), 8)
+    n_bottom <- min(ceiling(length(all_border_photos) * 0.4), 6)
     if (n_bottom > 0) {
       spacing_x <- (card_width - 2 * border_padding) / (n_bottom + 1)
       for (i in 1:n_bottom) {
@@ -713,7 +757,7 @@ if (!file.exists(summary_card_path) || force_rebuild) {
     
     # Left edge
     left_positions <- list()
-    n_left <- min(ceiling(length(all_border_photos) * 0.1), 4)
+    n_left <- min(ceiling(length(all_border_photos) * 0.1), 1)
     if (n_left > 0) {
       spacing_y <- (card_height - 2 * border_padding - 2 * thumb_size) / (n_left + 1)
       for (i in 1:n_left) {
@@ -723,7 +767,7 @@ if (!file.exists(summary_card_path) || force_rebuild) {
     
     # Right edge
     right_positions <- list()
-    n_right <- min(ceiling(length(all_border_photos) * 0.1), 4)
+    n_right <- min(ceiling(length(all_border_photos) * 0.1), 1)
     if (n_right > 0) {
       spacing_y <- (card_height - 2 * border_padding - 2 * thumb_size) / (n_right + 1)
       for (i in 1:n_right) {
@@ -841,11 +885,11 @@ if (!file.exists(summary_card_path) || force_rebuild) {
     )
     
     canvas <- magick::image_annotate(canvas,
-                                     text = summary_stats$date_range,
-                                     size = 40,
+                                     text = paste0(format(date_min, "%B %d"), " - ", format(date_max, "%d"), "\n", format(date_max, "%Y")),
+                                     size = 80,
                                      color = "#90EE90",
                                      font = "sans",
-                                     location = sprintf("+%d+%d", center_x + 100, center_y + 120),
+                                     location = sprintf("+%d+%d", center_x + 100, center_y + 50),
                                      gravity = "northwest"
     )
     
@@ -902,7 +946,8 @@ sat <- maptiles::get_tiles(
   provider = "Esri.WorldImagery",
   zoom = base_map_zoom,
   crop = TRUE,
-  cachedir = tempdir(),
+  cachedir = base_map_dir,
+  forceDownload = force_refetch_maps,
   verbose = FALSE
 )
 
@@ -935,36 +980,76 @@ bbox_master <- sf::st_bbox(c(
   xmax = max(obs_xy_tmp$longitude) + buffer_km/111, ymax = max(obs_xy_tmp$latitude) + buffer_km/111),
   crs = 4326)
 
-# OSM road/water overlays: reuse the on-disk cache unless rebuilding, so we
-# don't re-download (and re-hit the Overpass rate limits) on every render.
-roads_cache <- file.path(out_dir, "osm_roads.gpkg")
-water_cache <- file.path(out_dir, "osm_water.gpkg")
-if (!force_rebuild && file.exists(roads_cache) && file.exists(water_cache)) {
-  cat("  Using cached OSM road/water overlays\n\n")
-  roads_sf <- tryCatch(sf::st_read(roads_cache, quiet = TRUE), error = function(e) NULL)
-  water_sf <- tryCatch(sf::st_read(water_cache, quiet = TRUE), error = function(e) NULL)
-} else {
-  cat("  Fetching OSM roads and waterways...\n")
-  roads_sf <- fetch_osm_lines("highway",
-    c("motorway", "trunk", "primary", "secondary", "tertiary", "unclassified", "residential"),
-    bbox_expanded)
-  water_sf <- fetch_osm_lines("waterway", c("river", "stream"), bbox_expanded)
-  # Clip to the satellite extent so stray roads/waterways don't enlarge the map
-  if (!is.null(roads_sf)) roads_sf <- tryCatch(suppressWarnings(sf::st_crop(roads_sf, bbox_master)),
-                                               error = function(e) roads_sf)
-  if (!is.null(water_sf)) water_sf <- tryCatch(suppressWarnings(sf::st_crop(water_sf, bbox_master)),
-                                               error = function(e) water_sf)
-  # Cache for next time (only when the fetch actually returned geometry)
-  if (!is.null(roads_sf) && nrow(roads_sf) > 0)
-    tryCatch(sf::st_write(roads_sf, roads_cache, delete_dsn = TRUE, quiet = TRUE), error = function(e) NULL)
-  if (!is.null(water_sf) && nrow(water_sf) > 0)
-    tryCatch(sf::st_write(water_sf, water_cache, delete_dsn = TRUE, quiet = TRUE), error = function(e) NULL)
-  cat("  OSM overlays fetched, clipped and cached\n\n")
+# OSM overlays. Roads and tracks share the OSM "highway" key, so they are fetched
+# in ONE query and split by tag (avoids a second, late tracks download). Water is a
+# separate "waterway" query. Each layer caches to its own .gpkg, with a .none marker
+# for empty layers, so nothing re-downloads once resolved (unless force_refetch_maps).
+road_types  <- c("motorway", "trunk", "primary", "secondary", "tertiary", "unclassified", "residential")
+track_types <- c("path", "track", "footway", "bridleway", "cycleway")
+roads_cache  <- file.path(out_dir, "osm_roads.gpkg");  roads_none  <- file.path(out_dir, "osm_roads.none")
+tracks_cache <- file.path(out_dir, "osm_tracks.gpkg"); tracks_none <- file.path(out_dir, "osm_tracks.none")
+water_cache  <- file.path(out_dir, "osm_water.gpkg");  water_none  <- file.path(out_dir, "osm_water.none")
+.osm_ready <- function(cache, none) !force_refetch_maps && (file.exists(cache) || file.exists(none))
+.osm_load  <- function(cache) if (file.exists(cache)) tryCatch(sf::st_read(cache, quiet = TRUE), error = function(e) NULL) else NULL
+.osm_save  <- function(ly, cache, none) {
+  if (!is.null(ly) && nrow(ly) > 0) {
+    tryCatch(sf::st_write(ly, cache, delete_dsn = TRUE, quiet = TRUE), error = function(e) NULL)
+    if (file.exists(none)) unlink(none)
+  } else writeLines("no features", none)   # skip-marker so this layer is not re-queried
 }
+if (.osm_ready(roads_cache, roads_none) && .osm_ready(tracks_cache, tracks_none)) {
+  roads_sf <- .osm_load(roads_cache); tracks_sf <- .osm_load(tracks_cache)
+  cat("  Using cached OSM roads + tracks\n")
+} else {
+  cat("  Fetching OSM highways (roads + tracks in one query)...\n")
+  hw <- fetch_osm_lines("highway", c(road_types, track_types), bbox_expanded)
+  if (!is.null(hw)) hw <- tryCatch(suppressWarnings(sf::st_crop(hw, bbox_master)), error = function(e) hw)
+  if (!is.null(hw) && "highway" %in% names(hw)) {
+    roads_sf  <- hw[hw$highway %in% road_types, ]
+    tracks_sf <- hw[hw$highway %in% track_types, ]
+  } else { roads_sf <- NULL; tracks_sf <- NULL }
+  .osm_save(roads_sf,  roads_cache,  roads_none)
+  .osm_save(tracks_sf, tracks_cache, tracks_none)
+}
+if (.osm_ready(water_cache, water_none)) {
+  water_sf <- .osm_load(water_cache); cat("  Using cached OSM water\n")
+} else {
+  cat("  Fetching OSM water...\n")
+  water_sf <- fetch_osm_lines("waterway", c("river", "stream"), bbox_expanded)
+  if (!is.null(water_sf)) water_sf <- tryCatch(suppressWarnings(sf::st_crop(water_sf, bbox_master)), error = function(e) water_sf)
+  .osm_save(water_sf, water_cache, water_none)
+}
+cat("\n")
 
 # ==============================================================================
 # FIGURE 1: OBSERVATION HOTSPOTS (JITTERED MAP)
 # ==============================================================================
+
+# Plantae point ring: only slightly brighter than the base Plantae fill (not neon)
+.lighten <- function(col, amt) { v <- grDevices::col2rgb(col)[,1]/255; v <- v + (1 - v) * amt; grDevices::rgb(v[1], v[2], v[3]) }
+plantae_ring_col <- tryCatch(.lighten(iconic_cols[["Plantae"]], 0.28), error = function(e) "#8FBF8F")
+
+# Render the HQ hut as a square PNG (drawn 1:1 like the slideshow, so it is NOT
+# aspect-distorted by the legend panel) for use as a legend icon.
+hut_icon_path <- file.path(slides_dir, "hq_hut_icon.png")
+if (!file.exists(hut_icon_path) || force_rebuild) {
+  tryCatch({
+    .Wp <- 240; .cx <- .Wp/2; .s <- .Wp*0.42
+    .hi <- magick::image_draw(magick::image_blank(.Wp, .Wp, "none"))
+    .base <- .Wp*0.86; .top <- .base - .s*0.75
+    .bw <- .s*0.55; .dw <- .s*0.16; .dh <- .s*0.42
+    graphics::polygon(c(.cx-.bw,.cx-.bw,.cx+.bw,.cx+.bw,.cx+.dw,.cx+.dw,.cx-.dw,.cx-.dw),
+                      c(.base,.top,.top,.base,.base,.base-.dh,.base-.dh,.base), col="white", border=NA)
+    .rw <- .s*0.85; .rh <- .s*0.5
+    graphics::polygon(c(.cx-.rw,.cx+.rw,.cx), c(.top,.top,.top-.rh), col="white", border=NA)
+    .px <- .cx+.s*0.45; .ptop <- .top-.rh-.s*0.55; .phw <- .s*0.06
+    graphics::polygon(c(.px-.phw,.px+.phw,.px+.phw,.px-.phw), c(.top,.top,.ptop,.ptop), col="white", border=NA)
+    .fh <- .s*0.32; .fw <- .s*0.5
+    graphics::polygon(c(.px,.px+.fw,.px+.fw*0.8,.px+.fw,.px),
+                      c(.ptop,.ptop+.fh*0.15,.ptop+.fh*0.5,.ptop+.fh*0.85,.ptop+.fh), col="white", border=NA)
+    grDevices::dev.off(); magick::image_write(.hi, hut_icon_path)
+  }, error = function(e) cat("  hut icon render failed:", conditionMessage(e), "\n"))
+}
 
 cat("=== GENERATING FIGURE 1: OBSERVATION HOTSPOTS ===\n")
 
@@ -972,6 +1057,7 @@ fig1_path <- file.path(slides_dir, "fig_observation_hotspots_jittered.png")
 
 if (!file.exists(fig1_path) || force_rebuild) {
   cat("Creating hotspots map...\n")
+  tryCatch({
   
   obs_sf <- obs |>
     dplyr::filter(!is.na(longitude), !is.na(latitude)) |>
@@ -991,7 +1077,7 @@ if (!file.exists(fig1_path) || force_rebuild) {
   
   bbox_sf <- sf::st_as_sfc(bbox_buffered)
   
-  tiles <- maptiles::get_tiles(bbox_sf, provider = "Esri.WorldImagery", zoom = base_map_zoom, crop = TRUE)
+  tiles <- maptiles::get_tiles(bbox_sf, provider = "Esri.WorldImagery", zoom = base_map_zoom, crop = TRUE, cachedir = base_map_dir, forceDownload = force_refetch_maps)
   
   # Extract coordinates and add jitter manually
   obs_coords <- obs_sf |>
@@ -1012,7 +1098,12 @@ if (!file.exists(fig1_path) || force_rebuild) {
     {if (!is.null(roads_sf) && nrow(roads_sf) > 0) {
       ggplot2::geom_sf(data = roads_sf, colour = "#B0B0B0", linewidth = 0.4, alpha = 0.7)
     }} +
-    ggplot2::geom_point(data = obs_coords,
+    {if (any(obs_coords$iconic_taxon == "Plantae"))
+       ggplot2::geom_point(data = obs_coords[obs_coords$iconic_taxon == "Plantae", ],
+                           ggplot2::aes(x = lon, y = lat),
+                           shape = 21, fill = iconic_cols[["Plantae"]], colour = plantae_ring_col,
+                           size = 3, stroke = 0.55, alpha = 0.5, inherit.aes = FALSE, show.legend = FALSE)} +
+    ggplot2::geom_point(data = obs_coords[obs_coords$iconic_taxon != "Plantae", ],
                         ggplot2::aes(x = lon, y = lat, color = iconic_taxon),
                         alpha = 0.47, size = 3, shape = 16, stroke = 0) +
     ggplot2::scale_color_manual(
@@ -1045,9 +1136,11 @@ if (!file.exists(fig1_path) || force_rebuild) {
   p1 <- p1 + ggplot2::theme(legend.text = ggtext::element_markdown(size = legend_text_size)) +
     ggplot2::guides(colour = ggplot2::guide_legend(ncol = legend_ncol, byrow = TRUE))
   p1 <- p1 + ggplot2::theme(legend.position = "none") +
-    hq_layers(bbox_buffered) + axis_two_breaks(bbox_buffered)
-  compose_with_legend(p1, sort(unique(obs$iconic_taxon)), fig1_path, map_frac = 54)
+    hq_layers(bbox_buffered, hq_lon, hq_lat) + axis_two_breaks(bbox_buffered)
+  compose_with_legend(p1, sort(unique(obs$iconic_taxon)), fig1_path, map_frac = 66, show_hq = TRUE,
+                      leg_text = 7, leg_colgap = 7.0, leg_lmar = 0, leg_lpad = -0.3, leg_rpad = 6.0)
   cat("Hotspots map saved\n")
+  }, error = function(e) cat("  *** HOTSPOTS MAP (fig1) FAILED:", conditionMessage(e), "***\n"))
 } else {
   cat("Using cached hotspots map\n")
 }
@@ -1087,7 +1180,7 @@ if (!file.exists(fig1b_path) || force_rebuild) {
   bbox_sf <- sf::st_as_sfc(bbox_buffered)
   
   # Reuse the same tiles to save time
-  tiles_no_plants <- maptiles::get_tiles(bbox_sf, provider = "Esri.WorldImagery", zoom = base_map_zoom, crop = TRUE)
+  tiles_no_plants <- maptiles::get_tiles(bbox_sf, provider = "Esri.WorldImagery", zoom = base_map_zoom, crop = TRUE, cachedir = base_map_dir, forceDownload = force_refetch_maps)
   
   # Extract coordinates and add jitter
   obs_coords_no_plants <- obs_sf_no_plants |>
@@ -1145,8 +1238,9 @@ if (!file.exists(fig1b_path) || force_rebuild) {
   p1b <- p1b + ggplot2::theme(legend.text = ggtext::element_markdown(size = legend_text_size)) +
     ggplot2::guides(colour = ggplot2::guide_legend(ncol = legend_ncol, byrow = TRUE))
   p1b <- p1b + ggplot2::theme(legend.position = "none") +
-    hq_layers(bbox_buffered) + axis_two_breaks(bbox_buffered)
-  compose_with_legend(p1b, sort(unique(obs_no_plants$iconic_taxon)), fig1b_path, map_frac = 54)
+    hq_layers(bbox_buffered, hq_lon, hq_lat) + axis_two_breaks(bbox_buffered)
+  compose_with_legend(p1b, sort(unique(obs_no_plants$iconic_taxon)), fig1b_path, map_frac = 66, show_hq = TRUE,
+                      leg_text = 7, leg_colgap = 7.0, leg_lmar = 0, leg_lpad = -0.3, leg_rpad = 6.0)
   cat("Hotspots map (no plants) saved\n")
 } else {
   cat("Using cached hotspots map (no plants)\n")
@@ -1193,10 +1287,13 @@ if (zoom_enable && nrow(obs) > 0) {
   if (nrow(chosen) > 0) {
     loc_tiles <- tryCatch(maptiles::get_tiles(sf::st_as_sfc(bbox_master),
                             provider = "Esri.WorldImagery",
-                            zoom = max(11L, base_map_zoom - 2L), crop = TRUE),
+                            zoom = max(11L, base_map_zoom - 2L), crop = TRUE, cachedir = base_map_dir, forceDownload = force_refetch_maps),
                           error = function(e) NULL)
     for (k in seq_len(nrow(chosen))) {
-      cx <- chosen$cx[k]; cy <- chosen$cy[k]; nobs <- chosen$Freq[k]
+      # centre the close-up on the cluster density (median of the cell's points),
+      # not the grid-cell centre, so observations sit in the middle of the frame
+      in_cell <- cell_x == as.numeric(chosen$cell_x[k]) & cell_y == as.numeric(chosen$cell_y[k])
+      cx <- stats::median(xy[in_cell, 1]); cy <- stats::median(xy[in_cell, 2]); nobs <- chosen$Freq[k]
       win_m <- sf::st_sfc(sf::st_polygon(list(matrix(c(
         cx - cs/2, cy - cs/2,  cx + cs/2, cy - cs/2,  cx + cs/2, cy + cs/2,
         cx - cs/2, cy + cs/2,  cx - cs/2, cy - cs/2), ncol = 2, byrow = TRUE))), crs = zoom_utm)
@@ -1217,10 +1314,16 @@ if (zoom_enable && nrow(obs) > 0) {
         tryCatch({
           zlvl <- if (zoom_window_m <= 600) 18L else 17L
           tiles_z <- maptiles::get_tiles(win_ll, provider = "Esri.WorldImagery",
-                                         zoom = zlvl, crop = TRUE)
+                                         zoom = zlvl, crop = TRUE, cachedir = base_map_dir, forceDownload = force_refetch_maps)
           p_zoom <- ggplot2::ggplot() +
             tidyterra::geom_spatraster_rgb(data = tiles_z, maxcell = 5e5) +
-            ggplot2::geom_point(data = win_df, ggplot2::aes(lon, lat, colour = iconic_taxon),
+            {if (any(win_df$iconic_taxon == "Plantae"))
+               ggplot2::geom_point(data = win_df[win_df$iconic_taxon == "Plantae", ],
+                                   ggplot2::aes(lon, lat), shape = 21,
+                                   fill = iconic_cols[["Plantae"]], colour = plantae_ring_col,
+                                   size = 3.2, stroke = 0.55, alpha = 0.85, inherit.aes = FALSE, show.legend = FALSE)} +
+            ggplot2::geom_point(data = win_df[win_df$iconic_taxon != "Plantae", ],
+                                ggplot2::aes(lon, lat, colour = iconic_taxon),
                                 alpha = 0.85, size = 3.2, shape = 16, stroke = 0) +
             ggplot2::scale_colour_manual(values = iconic_cols, guide = "none") +
             ggspatial::annotation_scale(location = "br", width_hint = 0.3,
@@ -1256,7 +1359,7 @@ if (zoom_enable && nrow(obs) > 0) {
           p_leg <- build_taxon_legend(present_w,
                      legend_ncol = if (length(present_w) > 9) 2 else 1, legend_text_sz = 11)
           right_col <- patchwork::wrap_plots(p_loc, p_leg, ncol = 1, heights = c(32, 68))
-          combo_z <- patchwork::wrap_plots(p_zoom, right_col, nrow = 1, widths = c(62, 38)) &
+          combo_z <- patchwork::wrap_plots(p_zoom, right_col, nrow = 1, widths = c(68, 32)) &
             ggplot2::theme(plot.background = ggplot2::element_rect(fill = "#040a11", colour = NA))
           ggplot2::ggsave(figz_path, combo_z, width = 16, height = 9, dpi = 150, bg = "#040a11")
           cat(sprintf("  Zoom %d saved (%d obs)\n", k, nobs))
@@ -1303,7 +1406,7 @@ if (!file.exists(fig2_path) || force_rebuild) {
     # same args as geom_treemap so icons land on their tiles; nudge cy/size below.
     # one shared layout so tiles, labels and icons all align
     # label line colours (tweak freely): taxon name / obs count / percentage
-    lab_name_col <- "#FFFFFF"
+    lab_name_col <- "#000000"
     lab_n_col    <- "#FFD27F"
     lab_pct_col  <- "#9FD0B6"
     icon_size  <- 0.10   # max silhouette size (used on the big tiles)
@@ -1321,8 +1424,10 @@ if (!file.exists(fig2_path) || force_rebuild) {
                       function(t) { p <- ensure_taxon_icon_tint(t, "#FFFFFF")
                                     if (is.na(p)) "" else p }, character(1)),
         show_icon  = percentage > 1 & nzchar(icon),   # no icon for taxa <= 1%
-        lsize      = pmax(2.2, pmin(6, 24 * pmin(w, h))),   # per-tile text size
-        dy         = pmin(0.05, h * 0.17),                  # gap between the 3 lines
+        lsize      = dplyr::if_else(percentage >= stats_min_pct,
+                       pmax(2.9, pmin(8, 32 * pmin(w, h))),                                   # >=3%: reduced 1/3
+                       pmax(3.2, pmin(8, 44 * pmin(w, h) * 8 / pmax(nchar(as.character(iconic_taxon)), 8)))),  # name-only: fit to box
+        dy         = pmin(0.075, h * 0.22),                 # gap between the 3 lines (widened for the larger labels)
         name_chars = nchar(as.character(iconic_taxon)),
         name_w     = icon_char * name_chars,                    # approx name width
         isize      = pmin(icon_size, icon_scale * sqrt(w * h)), # shrink icon on small tiles
@@ -1426,6 +1531,7 @@ if (!file.exists(fig3_path) || force_rebuild) {
   
   # Function to download image with proper user agent (like original script)
   dl_profile_image <- function(url, path) {
+    if (file.exists(path) && !force_refetch_photos) return(TRUE)
     if (is.na(url)) {
       cat("  Skipping NA URL for", basename(path), "\n")
       return(FALSE)
@@ -1615,6 +1721,19 @@ if (!file.exists(fig3_path) || force_rebuild) {
 
 cat("=== GENERATING FIGURE 4: OBSERVATIONS PER HOUR ===\n")
 
+# Day-aware layout shared by both hourly plots: 1-3 days in ONE row (a single day
+# fills the full width), 4 days as a 2x2 grid; height grows if days wrap to more rows.
+# Uses observed_on (a required field, always present) so it never depends on the time.
+# base R (length/unique) so it never pipes a dplyr chain into terra/sf's S4 nrow(),
+# which would break dplyr masking and error with "<col> not found"
+.dd <- obs$observed_on
+.dd <- .dd[!is.na(.dd) & .dd >= date_min & .dd <= date_max]
+.hourly_days <- length(unique(.dd))
+n_days_h     <- max(1L, .hourly_days)
+facet_ncol_h <- if (n_days_h <= 3) n_days_h else 2L   # 1-3 in one row, 4 as 2x2 (5+ wraps in 2 cols)
+facet_nrow_h <- ceiling(n_days_h / facet_ncol_h)
+hourly_h     <- 5.5 + 2.0 * facet_nrow_h              # scales with the actual number of rows
+
 fig4_path <- file.path(slides_dir, "fig_observations_by_hour.png")
 
 if (!file.exists(fig4_path) || force_rebuild) {
@@ -1659,7 +1778,7 @@ if (!file.exists(fig4_path) || force_rebuild) {
                       label = "☾", size = 8, color = "#B0C4DE") +  # Moon symbol (after sunset)
     # Data bars
     ggplot2::geom_col(fill = "#BF6C3B") +
-    ggplot2::facet_wrap(~ day_label, ncol = 2) +   # shared y -> single axis on the left only
+    ggplot2::facet_wrap(~ day_label, ncol = facet_ncol_h) +   # shared y -> single axis on the left only
     ggplot2::scale_x_continuous(
       breaks = seq(0, 24, 3),  # Show labels every 3 hours
       limits = c(0, 24),
@@ -1673,13 +1792,13 @@ if (!file.exists(fig4_path) || force_rebuild) {
     theme_bioblitz() +
     ggplot2::theme(
       strip.text = ggplot2::element_text(colour = "#F7FAFC", face = "bold", size = legend_text_size),
-      panel.spacing.x = ggplot2::unit(0.5, "lines"),   # tighter gap between the two days
+      panel.spacing.x = ggplot2::unit(0.5, "lines"),   # tighter gap between day panels
       plot.title = ggplot2::element_text(size = plot_title_size, hjust = 0.5, 
                                          color = "#F7FAFC", face = "bold")
     )
   
   # wider aspect than the other charts so the distributions fill more of the slide
-  ggplot2::ggsave(fig4_path, p4, width = 16, height = 7.5, dpi = 300)
+  ggplot2::ggsave(fig4_path, p4, width = 16, height = hourly_h, dpi = 300)
   cat("Half-hourly observations chart saved (with day/night indicators)\n")
 } else {
   cat("Using cached hourly chart\n")
@@ -1739,7 +1858,7 @@ if (!file.exists(fig5_path) || force_rebuild) {
                       label = "☾", size = 8, color = "#B0C4DE") +  # Moon symbol (after sunset)
     # Data bars
     ggplot2::geom_col() +
-    ggplot2::facet_wrap(~ day_label, ncol = 2) +   # shared y -> single axis on the left only
+    ggplot2::facet_wrap(~ day_label, ncol = facet_ncol_h) +   # shared y -> single axis on the left only
     ggplot2::scale_x_continuous(
       breaks = seq(0, 24, 3),  # Show labels every 3 hours
       limits = c(0, 24),
@@ -1758,7 +1877,7 @@ if (!file.exists(fig5_path) || force_rebuild) {
     theme_bioblitz() +
     ggplot2::theme(
       strip.text = ggplot2::element_text(colour = "#F7FAFC", face = "bold", size = legend_text_size),
-      panel.spacing.x = ggplot2::unit(0.5, "lines"),   # tighter gap between the two days
+      panel.spacing.x = ggplot2::unit(0.5, "lines"),   # tighter gap between day panels
       plot.title = ggplot2::element_text(size = plot_title_size, hjust = 0.5, 
                                          color = "#F7FAFC", face = "bold"),
       legend.position = "right"
@@ -1767,7 +1886,7 @@ if (!file.exists(fig5_path) || force_rebuild) {
   p5 <- p5 + ggplot2::theme(legend.text = ggtext::element_markdown(size = legend_text_size)) +
     ggplot2::guides(fill = ggplot2::guide_legend(ncol = legend_ncol, byrow = TRUE))
   p5 <- p5 + ggplot2::theme(legend.position = "none")
-  compose_with_legend(p5, sort(unique(obs$iconic_taxon)), fig5_path, map_frac = 68, h = 7.5,
+  compose_with_legend(p5, sort(unique(obs$iconic_taxon)), fig5_path, map_frac = 68, h = hourly_h,
                       leg_icon = 0.07, leg_text = 6, leg_colgap = 9,
                       leg_lmar = 0, leg_rpad = 7, leg_lpad = -0.4)
   cat("Half-hourly stacked chart saved (with day/night indicators)\n")
@@ -2567,29 +2686,7 @@ if (!exists("chart_fig_height")) chart_fig_height <- 8
 
 ref_line <- "#CBD5E0"
 
-# --- OSM fetch settings (tune if your area is slow or under-mapped) ----------
-overpass_urls <- c(
-  "https://overpass-api.de/api/interpreter",
-  "https://overpass.kumi.systems/api/interpreter",
-  "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
-)
-osm_timeout <- 180   # seconds the Overpass server may spend per query
-osm_tries   <- 3     # attempts per mirror before moving to the next
-
-fetch_osm_sf <- function(build_query, label) {
-  for (url in overpass_urls) {
-    osmdata::set_overpass_url(url)
-    for (k in seq_len(osm_tries)) {
-      out <- tryCatch(build_query(), error = function(e) {
-        cat(sprintf("    %s: %s (try %d, %s)\n", label, conditionMessage(e),
-                    k, sub("https://", "", url))); NULL })
-      if (!is.null(out)) return(out)
-      Sys.sleep(3 * k)
-    }
-  }
-  cat("    ", label, ": all attempts failed; its figure will be skipped.\n", sep = "")
-  NULL
-}
+# (OSM highways+water are fetched once earlier; tracks are reused below.)
 
 # --- Local projected CRS (auto UTM-south zone) -------------------------------
 ok <- !is.na(obs$longitude) & !is.na(obs$latitude)
@@ -2599,33 +2696,8 @@ cat("  Using projected CRS EPSG:", metric_crs, "\n")
 obs_sf   <- sf::st_as_sf(obs[ok, ], coords = c("longitude", "latitude"), crs = 4326)
 obs_proj <- sf::st_transform(obs_sf, metric_crs)
 
-# --- Tracks (one lighter query per highway type, then combined) --------------
-tracks_cache <- file.path(out_dir, "osm_tracks.gpkg")
-tracks <- tryCatch({
-  if (force_rebuild || !file.exists(tracks_cache)) {
-    cat("  Fetching OSM tracks...\n")
-    track_types <- base::c("path", "track", "footway", "bridleway", "cycleway")
-    tk <- fetch_osm_sf(function() {
-      geoms <- list()
-      for (tt in track_types) {
-        r <- osmdata::add_osm_feature(
-               osmdata::opq(as.numeric(bbox_expanded), timeout = osm_timeout),
-               key = "highway", value = tt) |> osmdata::osmdata_sf()
-        if (!is.null(r$osm_lines) && nrow(r$osm_lines) > 0)
-          geoms[[tt]] <- sf::st_geometry(r$osm_lines)
-      }
-      if (!length(geoms)) return(NULL)
-      sf::st_sf(geometry = do.call(base::c, geoms))
-    }, "tracks")
-    if (!is.null(tk)) sf::st_write(tk, tracks_cache, delete_dsn = TRUE, quiet = TRUE)
-    tk
-  } else {
-    sf::st_read(tracks_cache, quiet = TRUE)
-  }
-}, error = function(e) {
-  cat("    tracks: skipped (", conditionMessage(e), ")\n", sep = "")
-  NULL
-})
+# --- Tracks: reuse the layer split from the early combined highway fetch -----
+tracks <- if (exists("tracks_sf")) tracks_sf else NULL
 
 tracks_u <- if (!is.null(tracks) && nrow(tracks) > 0)
               sf::st_union(sf::st_transform(tracks, metric_crs)) else NULL
@@ -2720,7 +2792,7 @@ dir.create(showcase_dir, showWarnings = FALSE, recursive = TRUE)
 # ---- photo fetch: observation id -> cached square thumbnail -----------------
 fetch_obs_thumb <- function(obs_id, key, px = thumb_px) {
   out <- file.path(showcase_dir, paste0(key, ".jpg"))
-  if (file.exists(out) && !force_rebuild) return(out)
+  if (file.exists(out) && !force_refetch_photos) return(out)
   tryCatch({
     d <- inat_get(paste0("observations/", obs_id))
     if (length(d$results) == 0 || length(d$results[[1]]$photos) == 0) return(NA_character_)
@@ -2801,7 +2873,14 @@ if (force_rebuild || !file.exists(tiers_path)) {
   x_right <- 6.6     # rightmost photo column (grid sits in the right ~60%, clear of labels)
   col_gap <- 1.68    # wider column spacing so long species names clear the next photo
   grid$cx <- x_right - (n_per_tier - grid$col) * col_gap
+  # subtle lighter-navy bands behind rows 1, 3, 5 (full width, through the photo gaps)
+  # so each row's left label reads as belonging to its row of photos
+  .band_y   <- (ny - c(1L, 3L, 5L)); .band_y <- .band_y[.band_y >= 0]
+  row_bands <- data.frame(ymin = .band_y - 0.5, ymax = .band_y + 0.5)
   p_tiers <- ggplot2::ggplot(grid, ggplot2::aes(cx, ny - yrow)) +
+    ggplot2::geom_rect(data = row_bands, inherit.aes = FALSE,
+                       ggplot2::aes(xmin = lab_x - 0.2, xmax = x_right + 0.7, ymin = ymin, ymax = ymax),
+                       fill = "#122b45", colour = NA) +
     ggimage::geom_image(ggplot2::aes(image = image), size = thumb_size, asp = 2.5) +
     # species name along the BOTTOM of each photo, on a semi-transparent strip
     ggplot2::geom_label(ggplot2::aes(x = cx - half_x, y = (ny - yrow) - half_y, label = taxon_name),
@@ -2844,7 +2923,7 @@ make_rank_curve <- function(sp_tbl, out_path, key) {
                           character(1))
   pick_df <- pick_df |> dplyr::filter(!is.na(image))
 
-  ymax  <- max(sp_tbl$n); band <- ymax * 1.9          # thumbnail row height (log axis)
+  ymax  <- max(sp_tbl$n); band <- ymax * 2.3          # thumbnail row height (log axis)
   pick_df$tx <- seq(nsp * 0.06, nsp * 0.94, length.out = nrow(pick_df))
   pick_df$ty <- ymax * 1.25
 
@@ -2858,12 +2937,9 @@ make_rank_curve <- function(sp_tbl, out_path, key) {
     ggimage::geom_image(data = pick_df, ggplot2::aes(tx, ty, image = image),
                         size = 0.075, asp = 2.5) +
     ggplot2::geom_text(data = pick_df,
-                       ggplot2::aes(tx, band, label = taxon_name),
-                       fontface = "italic", colour = INK, size = 2.8, vjust = 0) +
-    ggplot2::geom_text(data = pick_df,
-                       ggplot2::aes(tx, band, label = paste0("rank ", rank, " \u00b7 ", n, " obs")),
-                       colour = MUT, size = 2.4, vjust = 1.4) +
-    ggplot2::scale_y_log10(limits = c(0.8, band * 1.25)) +
+                       ggplot2::aes(tx, band, label = sub(" ", "\n", taxon_name)),
+                       fontface = "italic", colour = INK, size = 6.3, vjust = 0, lineheight = 0.9) +
+    ggplot2::scale_y_log10(limits = c(0.8, band * 1.65)) +
     ggplot2::labs(caption = credit_curve,
                   x = "Species rank (commonest to rarest)", y = "Observations (log)") +
     theme_bioblitz()
@@ -3031,6 +3107,151 @@ logo_exists <- file.exists(bioblitz_logo)
 cat("Logo file check:", if(logo_exists) "FOUND" else "NOT FOUND", "\n")
 cat("  Path checked:", bioblitz_logo, "\n")
 
+# ============================================================================
+# CONTRIBUTOR AWARDS (podium slides) - one slide per category, top-3 podium
+# ============================================================================
+include_awards <- TRUE   # FALSE = skip the awards section entirely
+award_min_obs  <- 5      # a person needs at least this many observations to be eligible
+
+award_slides_md <- ""
+if (isTRUE(include_awards)) {
+  award_dir <- file.path(slides_dir, "award_photos")
+  dir.create(award_dir, recursive = TRUE, showWarnings = FALSE)
+
+  .haversine <- function(lon1, lat1, lon2, lat2) {
+    r <- 6371; d <- pi/180
+    a <- sin((lat2-lat1)*d/2)^2 + cos(lat1*d)*cos(lat2*d)*sin((lon2-lon1)*d/2)^2
+    2*r*asin(pmin(1, sqrt(a)))
+  }
+  award_photo <- function(login, icon_url) {
+    if (is.na(login) || is.na(icon_url) || !nzchar(icon_url)) return(NA_character_)
+    out <- file.path(award_dir, paste0("obs_", gsub("[^A-Za-z0-9_-]", "_", login), ".png"))
+    if (file.exists(out) && !isTRUE(force_refetch_photos)) return(out)
+    ok <- tryCatch({
+      raw <- httr2::resp_body_raw(httr2::req_perform(httr2::request(icon_url)))
+      img <- magick::image_crop(magick::image_scale(magick::image_read(raw), "400x400^"),
+                                "400x400+0+0", gravity = "center")
+      mask <- magick::image_read_svg('<svg width="400" height="400"><circle cx="200" cy="200" r="198" fill="white"/></svg>', width = 400, height = 400)
+      ring <- magick::image_read_svg('<svg width="400" height="400"><circle cx="200" cy="200" r="195" fill="none" stroke="#3498DB" stroke-width="9"/></svg>', width = 400, height = 400)
+      img <- magick::image_composite(magick::image_composite(img, mask, operator = "DstIn"), ring)
+      img <- magick::image_background(img, "#040a11")   # flatten corners to the (flat) podium background
+      magick::image_write(img, out); TRUE
+    }, error = function(e) FALSE)
+    if (isTRUE(ok)) out else NA_character_
+  }
+  render_podium <- function(win, out_path, suffix = "") {
+    win <- win[order(win$rank), , drop = FALSE]
+    win$observer_name <- ifelse(is.na(win$observer_name) | win$observer_name == "",
+                                win$observer_login, win$observer_name)
+    win$x     <- c(`1` = 2, `2` = 1, `3` = 3)[as.character(win$rank)]
+    win$py    <- c(`1` = 0.60, `2` = 0.50, `3` = 0.50)[as.character(win$rank)]
+    win$medal <- c(`1` = "1st", `2` = "2nd", `3` = "3rd")[as.character(win$rank)]
+    win$rcol  <- c(`1` = "#E6B800", `2` = "#C9CDD2", `3` = "#CD7F32")[as.character(win$rank)]
+    win$vlab  <- paste0(prettyNum(round(win$value, 1), big.mark = ","), suffix)
+    win$podh  <- c(`1` = 0.16, `2` = 0.11, `3` = 0.07)[as.character(win$rank)]
+    hp <- !is.na(win$photo)
+    g <- ggplot2::ggplot(win, ggplot2::aes(x, py)) +
+      ggplot2::geom_rect(ggplot2::aes(xmin = x - 0.36, xmax = x + 0.36, ymin = 0, ymax = podh, fill = rcol), alpha = 0.6, colour = NA) +
+      ggplot2::scale_fill_identity() +
+      { if (any(win$rank == 1 & hp)) ggimage::geom_image(data = win[win$rank == 1 & hp, ], ggplot2::aes(image = photo), size = 0.34, asp = 1) } +
+      { if (any(win$rank != 1 & hp)) ggimage::geom_image(data = win[win$rank != 1 & hp, ], ggplot2::aes(image = photo), size = 0.26, asp = 1) } +
+      ggplot2::geom_text(ggplot2::aes(x, py + 0.25, label = medal, colour = rcol), fontface = "bold", size = 13) +
+      ggplot2::geom_text(ggplot2::aes(x, py - 0.25, label = observer_name), colour = "#F7FAFC", fontface = "bold", size = 18) +
+      ggplot2::geom_text(ggplot2::aes(x, py - 0.32, label = vlab), colour = "#CBD5E0", size = 14) +
+      ggplot2::scale_colour_identity() +
+      ggplot2::scale_x_continuous(limits = c(0.4, 3.6)) +
+      ggplot2::scale_y_continuous(limits = c(0, 1.0)) +
+      ggplot2::labs(x = NULL, y = NULL) +
+      theme_bioblitz() +
+      ggplot2::theme(axis.text = ggplot2::element_blank(), axis.title = ggplot2::element_blank(),
+                     panel.grid.major = ggplot2::element_blank(), panel.grid.minor = ggplot2::element_blank(),
+                     panel.background = ggplot2::element_rect(fill = "#040a11", colour = NA),
+                     plot.background  = ggplot2::element_rect(fill = "#040a11", colour = NA))
+    ggplot2::ggsave(out_path, g, width = 16, height = 9, dpi = 300, bg = "#040a11")
+  }
+
+  .elig_ids <- obs |> dplyr::filter(!is.na(observer_login)) |>
+    dplyr::count(observer_login, name = "._n") |>
+    dplyr::filter(`._n` >= award_min_obs) |> dplyr::pull(observer_login)
+  obs_a <- obs |> dplyr::filter(observer_login %in% .elig_ids)
+  .grp <- function(d) dplyr::group_by(d, observer_login, observer_name, observer_icon_url)
+
+  specs <- list()
+  add <- function(id, title, subtitle, suffix, fn, dir = "desc")
+    specs[[length(specs) + 1]] <<- list(id = id, title = title, subtitle = subtitle,
+                                        suffix = suffix, fn = fn, dir = dir)
+
+  add("most_obs", "Most Observations", "the biggest contributors overall", " obs",
+      function(d) dplyr::summarise(.grp(d), value = dplyr::n(), .groups = "drop"))
+  add("most_species", "Most Diverse", "the most different species recorded", " species",
+      function(d) dplyr::summarise(.grp(dplyr::filter(d, taxon_rank == "species")), value = dplyr::n_distinct(taxon_name), .groups = "drop"))
+  add("well_rounded", "Jack of All Trades", "recorded across the most groups of life", " groups",
+      function(d) dplyr::summarise(.grp(d), value = dplyr::n_distinct(iconic_taxon), .groups = "drop"))
+  add("specialised", "The Specialist", "the highest share of records in one group", "%",
+      function(d) dplyr::summarise(.grp(d), value = round(100 * max(table(iconic_taxon)) / dplyr::n()), .groups = "drop"))
+  add("completist", "The Completist", "the most records of a single species", " obs",
+      function(d) dplyr::summarise(.grp(dplyr::count(dplyr::filter(d, taxon_rank == "species"), observer_login, observer_name, observer_icon_url, taxon_name)), value = max(n), .groups = "drop"))
+  add("explorer", "The Explorer", "the observation furthest from HQ", " km",
+      function(d) dplyr::summarise(.grp(dplyr::mutate(dplyr::filter(d, !is.na(longitude), !is.na(latitude)), dkm = .haversine(longitude, latitude, hq_lon, hq_lat))), value = round(max(dkm), 1), .groups = "drop"))
+  add("ground_covered", "Ground Covered", "the widest spread of observations", " km",
+      function(d) dplyr::summarise(.grp(dplyr::filter(d, !is.na(longitude), !is.na(latitude))), value = round(.haversine(min(longitude), min(latitude), max(longitude), max(latitude)), 1), .groups = "drop"))
+  add("night_owl", "Night Owl", "the most observations after dark", " obs",
+      function(d) dplyr::summarise(.grp(dplyr::filter(dplyr::mutate(dplyr::filter(d, !is.na(time_observed_at)), .h = lubridate::hour(lubridate::with_tz(lubridate::as_datetime(time_observed_at), "Australia/Perth"))), .h >= 20 | .h < 5)), value = dplyr::n(), .groups = "drop"))
+  add("early_bird", "Early Bird", "the most observations around dawn", " obs",
+      function(d) dplyr::summarise(.grp(dplyr::filter(dplyr::mutate(dplyr::filter(d, !is.na(time_observed_at)), .h = lubridate::hour(lubridate::with_tz(lubridate::as_datetime(time_observed_at), "Australia/Perth"))), .h >= 4 & .h < 8)), value = dplyr::n(), .groups = "drop"))
+  add("power_hour", "Power Hour", "the most observations in one half-hour", " obs",
+      function(d) dplyr::summarise(.grp(dplyr::count(dplyr::mutate(dplyr::filter(d, !is.na(time_observed_at)), .b = floor(as.numeric(lubridate::as_datetime(time_observed_at)) / 1800)), observer_login, observer_name, observer_icon_url, .b)), value = max(n), .groups = "drop"))
+  add("rarest_find", "Rarest Finds", "the most conservation-listed species", " listed",
+      function(d) dplyr::summarise(.grp(dplyr::filter(d, !is.na(conservation_status), conservation_status != "")), value = dplyr::n_distinct(taxon_name), .groups = "drop"))
+  add("marathon", "The Marathon", "the most observations in a single day", " obs",
+      function(d) dplyr::summarise(.grp(dplyr::count(dplyr::filter(d, !is.na(observed_on)), observer_login, observer_name, observer_icon_url, observed_on)), value = max(n), .groups = "drop"))
+  add("gold_standard", "Gold Standard", "the most research-grade observations", " obs",
+      function(d) dplyr::summarise(.grp(dplyr::filter(d, quality_grade == "research")), value = dplyr::n(), .groups = "drop"))
+
+  .champ <- c(Plantae = "Most Plants", Fungi = "Most Fungi", Insecta = "Most Insects",
+              Arachnida = "Most Spiders", Aves = "Most Birds", Mollusca = "Most Molluscs",
+              Reptilia = "Most Reptiles", Amphibia = "Most Amphibians",
+              Mammalia = "Most Mammals", Actinopterygii = "Most Fish")
+  for (grp in intersect(names(.champ), unique(obs_a$iconic_taxon))) local({
+    g0 <- grp
+    add(paste0("most_", tolower(g0)), .champ[[g0]], paste0("who recorded the most ", tolower(g0)), " obs",
+        function(d) dplyr::summarise(.grp(dplyr::filter(d, iconic_taxon == g0)), value = dplyr::n(), .groups = "drop"))
+  })
+
+  # Which awards to include (edit to a subset once you have picked favourites):
+  award_ids <- vapply(specs, function(s) s$id, character(1))   # default = all defined
+
+  n_awards <- 0
+  for (sp in specs) {
+    if (!(sp$id %in% award_ids)) next
+    res <- tryCatch(sp$fn(obs_a), error = function(e) NULL)
+    if (is.null(res) || nrow(res) == 0) next
+    res <- res[is.finite(res$value) & res$value > 0, , drop = FALSE]
+    if (nrow(res) == 0) next
+    res <- res[order(if (sp$dir == "asc") res$value else -res$value), , drop = FALSE]
+    res <- utils::head(res, 3); res$rank <- seq_len(nrow(res))
+    res$photo <- vapply(seq_len(nrow(res)),
+                        function(i) award_photo(res$observer_login[i], res$observer_icon_url[i]), character(1))
+    noph <- is.na(res$photo)
+    if (any(noph)) {   # no profile pic -> random taxon silhouette as the avatar
+      ic <- unlist(lapply(sample(names(iconic_cols)), function(t) tryCatch(ensure_taxon_icon(t), error = function(e) NA_character_)))
+      ic <- ic[!is.na(ic) & nzchar(ic)]
+      if (length(ic)) res$photo[noph] <- sample(ic, sum(noph), replace = TRUE)
+    }
+    png <- file.path(slides_dir, paste0("award_", sp$id, ".png"))
+    if (force_rebuild || !file.exists(png))
+      tryCatch(render_podium(res, png, sp$suffix),
+               error = function(e) cat("  award render failed:", sp$id, conditionMessage(e), "\n"))
+    if (file.exists(png)) {
+      award_slides_md <- paste0(award_slides_md,
+        sprintf("## %s\n\n::: {.slide-subtitle}\n%s\n:::\n\n![](%s)\n\n", sp$title, sp$subtitle, basename(png)))
+      n_awards <- n_awards + 1
+    }
+  }
+  cat(sprintf("Contributor awards: %d slide(s)\n", n_awards))
+}
+
+
 # Generate QMD with conditional title slide
 # Use paste0() to avoid glue() delimiter conflicts with R code chunks
 if (logo_exists) {
@@ -3186,7 +3407,7 @@ example species, common to rare
 
 ![](fig_species_tiers.png)
 
-## The Big Picture
+', award_slides_md, '## The Big Picture
 
 ![](fig_chart_collage.png)
 
@@ -3338,7 +3559,7 @@ example species, common to rare
 
 ![](fig_species_tiers.png)
 
-## The Big Picture
+', award_slides_md, '## The Big Picture
 
 ![](fig_chart_collage.png)
 ')
