@@ -53,7 +53,7 @@ base_map_zoom <- 14    # Zoom level for satellite imagery (higher = more detail)
 buffer_km <- 2.5       # Buffer around observations in kilometers for map extent (optimized for tighter framing)
 
 # --- Force rebuild ---
-force_rebuild <- TRUE      # Set TRUE to regenerate all figures even if cached (revert to FALSE after a full run)
+force_rebuild <- FALSE      # Set TRUE to regenerate all figures even if cached (revert to FALSE after a full run)
 use_cached_data <- TRUE    # Set FALSE to fetch fresh data from iNaturalist
 
 # --- Map caching ---
@@ -72,6 +72,17 @@ vary_summary_photos  <- TRUE   # TRUE = vary the slide-2 border photos between r
 # --- Output Format Options ---
 render_html <- TRUE        # Generate HTML slideshow (revealjs)
 render_powerpoint <- FALSE  # Generate PowerPoint (.pptx) for manual editing
+render_pdf <- FALSE         # Generate a PDF copy of the HTML deck (needs Chrome + chromote)
+pdf_wait_s <- 6            # Seconds to let figures/fonts settle before printing.
+                           #   Raise this if the PDF comes out with blank/partial slides.
+pdf_timeout_s <- 300       # Seconds Chrome gets to rasterise the PDF. chromote defaults
+                           #   to only 10s, which a figure-heavy deck blows straight past.
+pdf_max_px <- 1600         # Longest edge (px) for figures IN THE PDF ONLY. Figures are saved
+                           #   at 300 dpi (maps reach 4500px) but never display taller than
+                           #   700px, so the PDF embeds ~10x more pixels than it can show.
+                           #   Figures are downsampled into a temporary copy of the deck just
+                           #   for printing; the HTML deck and the PNGs are left untouched.
+                           #   1200 = smaller, 2400 = sharper, 0 = off (print at full size).
 
 # --- Slideshow Timing (revealjs auto-advance, matches the photo slideshow) ---
 auto_advance_ms      <- 15000   # Auto-advance time in milliseconds (7000 = 7 seconds; 0 = disabled)
@@ -185,6 +196,34 @@ step_size <- 10            # Sample every N observations for rarefaction points
 # (e.g., 5 for <500 obs, 10 for 500-2000 obs, 20 for >2000 obs)
 
 rarefaction_rank_level <- "species"  # Taxonomic rank for rarefaction
+
+# ==============================================================================
+# SITE GROUPING (optional module)
+# ==============================================================================
+# Groups observations by survey site, using NEAREST SITE POINT. Each observation
+# is assigned to the closest site anchor; anything further than site_max_dist_m
+# from every anchor is reported as "Elsewhere" rather than dropped.
+#
+# Supply sites in ONE of two ways:
+#   1. sites_csv - a CSV with columns: site, lat, lon   (simplest, portable)
+#   2. sites_kmz - a Google Earth .kmz/.kml; each FOLDER becomes a site, and its
+#      Points become that site's anchors (falls back to LineString vertices for
+#      folders that contain only tracks)
+# A site may have SEVERAL anchors (site centre, car park, two ends of a
+# transect): list one row per anchor, repeating the site name. The observation is
+# assigned to the site owning the nearest anchor, so extra anchors simply widen
+# that site's catchment - they cannot cause a mis-assignment.
+include_sites <- TRUE     # TRUE = build the site module (needs sites_csv or sites_kmz)
+sites_csv <- "walpole_sites.csv" # e.g. "walpole_sites.csv" with columns site, lat, lon
+sites_kmz <- ""            # e.g. "WWBB2025_Site_Locations.kmz" (used if sites_csv is empty)
+site_max_dist_m <- 500     # Max distance from an anchor to count as "at" that site.
+                           #   Check the printed sensitivity table: pick a value where
+                           #   the unassigned count stops falling quickly.
+site_min_obs <- 30         # Sites below this are shown in the bar chart (greyed) but
+                           #   excluded from the rarefaction and PCoA, where small
+                           #   samples produce confident-looking nonsense.
+site_label_max <- 26       # Truncate long site names to this many characters
+site_show_elsewhere <- TRUE  # Show the unassigned records as a reference row
 # Should typically match rank_level above
 
 # --- Data Sufficiency Thresholds ---
@@ -238,6 +277,28 @@ if (length(to_install)) {
 invisible(lapply(req_pkgs, function(p) {
   suppressPackageStartupMessages(library(p, character.only = TRUE))
 }))
+
+# xml2 parses the KML inside a KMZ for the site module. Installed lazily so it is
+# only required by people who actually supply a .kmz.
+if (isTRUE(include_sites) && nzchar(sites_kmz) && !requireNamespace("xml2", quietly = TRUE)) {
+  cat("Installing xml2 (to read the KMZ site file)...\n")
+  tryCatch(install.packages("xml2", repos = "https://cloud.r-project.org"),
+           error = function(e) cat("  xml2 install failed; supply sites_csv instead.\n"))
+}
+# ggrepel spreads the site labels on the PCoA, scatter and accumulation slides
+if (isTRUE(include_sites) && !requireNamespace("ggrepel", quietly = TRUE)) {
+  cat("Installing ggrepel (for non-overlapping site labels)...\n")
+  tryCatch(install.packages("ggrepel", repos = "https://cloud.r-project.org"),
+           error = function(e) cat("  ggrepel install failed; labels may overlap.\n"))
+}
+
+# chromote drives headless Chrome for the PDF export (render_pdf). Installed
+# lazily so people who don't want a PDF are not forced to take the dependency.
+if (isTRUE(render_pdf) && !requireNamespace("chromote", quietly = TRUE)) {
+  cat("Installing chromote (for PDF export)...\n")
+  tryCatch(install.packages("chromote", repos = "https://cloud.r-project.org"),
+           error = function(e) cat("  chromote install failed; PDF export will be skipped.\n"))
+}
 
 cat("Packages loaded\n\n")
 
@@ -435,6 +496,115 @@ if (use_cached_data && file.exists(obs_cache_file)) {
 # Guarantee the timestamp column exists so the hourly plots and time-based awards
 # never error on a missing column (older caches or sparse records may lack it).
 if (!("time_observed_at" %in% names(obs))) obs$time_observed_at <- as.POSIXct(NA)
+
+# ==============================================================================
+# REFINE "ANIMALIA" INTO MEANINGFUL GROUPS (via iNaturalist ancestry)
+# ==============================================================================
+# iNaturalist tags every record with one of a small FIXED set of "iconic taxa".
+# For animals only eight exist (Insecta, Arachnida, Mollusca, Aves, Mammalia,
+# Reptilia, Amphibia, Actinopterygii), so every OTHER animal lineage - millipedes,
+# centipedes, worms, springtails, slaters, sharks - is lumped as plain "Animalia"
+# even when identified to species. This step looks up each Animalia taxon's
+# ancestry once and relabels it to a readable group, so the taxonomic figures
+# carry real signal instead of one vague bucket.
+#
+# It is event-agnostic: the lookup is keyed on STANDARD higher-taxon names
+# (Diplopoda, Annelida, ...) that are identical in any bioblitz. The taxon->group
+# map is cached to animalia_group_map.csv, so later runs only hit the API for
+# taxa they have not seen. A new column, display_taxon, holds iconic_taxon for
+# everything and the refined label for Animalia; the taxon figures use it.
+refine_animalia   <- TRUE                 # FALSE = leave Animalia as one category
+animalia_fallback <- "Other invertebrates"  # animal groups not in the table below
+
+# Standard ancestor name -> (display label, PhyloPic silhouette name). Deepest
+# match wins, so ordering does not matter and coarse + fine entries can coexist.
+# Extend this freely for groups your event turns up.
+# Labels are kept SHORT so they fit the treemap tiles; edit to taste.
+animalia_group_tbl <- tibble::tribble(
+  ~ancestor,         ~label,        ~icon,
+  "Diplopoda",       "Millipedes",  "Diplopoda",
+  "Chilopoda",       "Centipedes",  "Chilopoda",
+  "Collembola",      "Springtails", "Collembola",
+  "Isopoda",         "Slaters",     "Isopoda",
+  "Amphipoda",       "Amphipods",   "Amphipoda",
+  "Decapoda",        "Decapods",    "Decapoda",
+  "Malacostraca",    "Crustaceans", "Malacostraca",
+  "Annelida",        "Worms",       "Annelida",
+  "Platyhelminthes", "Flatworms",   "Platyhelminthes",
+  "Nematoda",        "Roundworms",  "Nematoda",
+  "Nemertea",        "Ribbon worms","Nemertea",
+  "Onychophora",     "Velvet worms","Onychophora",
+  "Cnidaria",        "Cnidarians",  "Cnidaria",
+  "Echinodermata",   "Echinoderms", "Echinodermata",
+  "Porifera",        "Sponges",     "Porifera",
+  "Chondrichthyes",  "Sharks",      "Chondrichthyes"
+)
+
+obs$display_taxon   <- obs$iconic_taxon      # default: unchanged
+animalia_cols       <- character(0)          # palette additions for refined groups
+animalia_icon_names <- character(0)          # refined label -> PhyloPic name
+
+if (isTRUE(refine_animalia) && any(obs$iconic_taxon == "Animalia", na.rm = TRUE)) {
+  cat("\n=== REFINING ANIMALIA (ancestry lookup) ===\n")
+  is_ani  <- obs$iconic_taxon == "Animalia" & !is.na(obs$iconic_taxon)
+  ani_ids <- sort(unique(obs$taxon_id[is_ani & !is.na(obs$taxon_id)]))
+  map_file <- file.path(out_dir, "animalia_group_map.csv")
+
+  known <- if (file.exists(map_file))
+    suppressWarnings(readr::read_csv(map_file, show_col_types = FALSE)) else
+    tibble::tibble(taxon_id = integer(0), label = character(0), icon = character(0))
+  todo <- setdiff(ani_ids, known$taxon_id)
+
+  # deepest ancestor match: ancestors come root -> tip, so scan tip -> root
+  classify <- function(anc_names) {
+    for (nm in rev(anc_names)) {
+      m <- which(animalia_group_tbl$ancestor == nm)
+      if (length(m)) return(c(animalia_group_tbl$label[m[1]], animalia_group_tbl$icon[m[1]]))
+    }
+    c(NA_character_, NA_character_)
+  }
+
+  if (length(todo)) {
+    cat("  Looking up ancestry for", length(todo), "taxa (cached after this)...\n")
+    fetched <- list()
+    for (b in split(todo, ceiling(seq_along(todo) / 30))) {
+      dat <- tryCatch({
+        req <- httr2::request(paste0("https://api.inaturalist.org/v1/taxa/", paste(b, collapse = ",")))
+        req <- httr2::req_timeout(httr2::req_user_agent(req, "walpole-datadive/1.0"), 30)
+        httr2::resp_body_json(httr2::req_perform(req), simplifyVector = FALSE)$results
+      }, error = function(e) { cat("    taxa lookup failed:", conditionMessage(e), "\n"); list() })
+      for (t in dat) {
+        anc <- vapply(t$ancestors %||% list(), function(a) a$name %||% NA_character_, character(1))
+        cl  <- classify(c(anc, t$name %||% NA_character_))
+        fetched[[length(fetched) + 1]] <- tibble::tibble(taxon_id = t$id, label = cl[1], icon = cl[2])
+      }
+    }
+    if (length(fetched)) {
+      known <- dplyr::distinct(dplyr::bind_rows(known, dplyr::bind_rows(fetched)),
+                               taxon_id, .keep_all = TRUE)
+      tryCatch(readr::write_csv(known, map_file), error = function(e) NULL)
+    }
+  } else cat("  Using cached ancestry map\n")
+
+  lut <- dplyr::filter(known, !is.na(label))
+  m   <- match(obs$taxon_id, lut$taxon_id)
+  obs$display_taxon[is_ani] <- ifelse(!is.na(m[is_ani]), lut$label[m[is_ani]], animalia_fallback)
+
+  present <- sort(setdiff(unique(obs$display_taxon[is_ani]), NA))
+  .ani_pal <- c("#D1603D", "#8E5572", "#4F7CAC", "#3C887E", "#B5A642", "#A0522D",
+                "#6A5ACD", "#C25B56", "#5F9EA0", "#9C6B30", "#7B8B6F", "#B0724A")
+  animalia_cols <- setNames(rep(.ani_pal, length.out = length(present)), present)
+  if (animalia_fallback %in% present) animalia_cols[[animalia_fallback]] <- "#8A8A82"
+  animalia_icon_names <- setNames(vapply(present, function(lb) {
+    ic <- animalia_group_tbl$icon[match(lb, animalia_group_tbl$label)]
+    if (is.na(ic)) "Animalia" else ic }, character(1)), present)
+  cat("  Animalia refined into:", paste(present, collapse = ", "), "\n")
+}
+
+# palettes and icon lookup used by the taxon figures (iconic + refined animals)
+treemap_cols   <- c(taxon_cols,  animalia_cols)
+bar_cols       <- c(iconic_cols, animalia_cols)
+icon_name_for  <- function(g) if (g %in% names(animalia_icon_names)) animalia_icon_names[[g]] else g
 
 # ==============================================================================
 # STYLING
@@ -1486,6 +1656,46 @@ if (!file.exists(fig2_path) || force_rebuild) {
   cat("Using cached taxon chart\n")
 }
 
+# ------------------------------------------------------------------------------
+# FIGURE 2b: INSIDE THE "OTHER ANIMALS" GROUP (the refined Animalia breakdown)
+# ------------------------------------------------------------------------------
+# Keeps the main treemap tidy (one "Animalia" tile) and gives that bucket its own
+# readable slide. Only appears when refine_animalia found sub-groups.
+fig_ani_path <- file.path(slides_dir, "fig_animalia_breakdown.png")
+animalia_slide_md <- ""
+if (isTRUE(refine_animalia) && any(obs$iconic_taxon == "Animalia", na.rm = TRUE)) {
+  if (force_rebuild || !file.exists(fig_ani_path)) {
+    cat("  Creating the 'other animals' breakdown...\n")
+    tryCatch({
+      ab <- obs |>
+        dplyr::filter(iconic_taxon == "Animalia") |>
+        dplyr::count(display_taxon, name = "n") |>
+        dplyr::arrange(n) |>
+        dplyr::mutate(grp = factor(display_taxon, levels = display_taxon))
+      pal <- animalia_cols
+      miss <- setdiff(as.character(ab$display_taxon), names(pal))
+      if (length(miss)) pal[miss] <- "#8A8A82"
+      pab <- ggplot2::ggplot(ab, ggplot2::aes(n, grp, fill = display_taxon)) +
+        ggplot2::geom_col(width = 0.72, colour = "#040a11", linewidth = 0.3) +
+        ggplot2::geom_text(ggplot2::aes(label = n), hjust = -0.35,
+                           colour = "#CBD5E0", size = 6) +
+        ggplot2::scale_fill_manual(values = pal, guide = "none") +
+        ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = c(0, 0.12))) +
+        ggplot2::labs(x = "Number of observations", y = NULL) +
+        theme_bioblitz() +
+        ggplot2::theme(panel.grid.major.y = ggplot2::element_blank())
+      ggplot2::ggsave(fig_ani_path, pab, width = chart_fig_width + 2,
+                      height = chart_fig_height + 1, dpi = 300, bg = "#040a11")
+      cat("    saved fig_animalia_breakdown.png\n")
+    }, error = function(e) cat("    breakdown failed:", conditionMessage(e), "\n"))
+  }
+  if (file.exists(fig_ani_path))
+    animalia_slide_md <- paste0(
+      "## Inside the Other Animals\n\n::: {.slide-subtitle}\n",
+      "what the \"Animalia\" group is made of\n:::\n\n",
+      "![](fig_animalia_breakdown.png)\n\n")
+}
+
 # ==============================================================================
 # FIGURE 3: TOP OBSERVERS
 # ==============================================================================
@@ -2485,6 +2695,531 @@ if (!file.exists(fig7a_path) || !file.exists(fig7b_path) || force_rebuild) {
 }
 
 # ==============================================================================
+# SITE GROUPING MODULE - composition, PCoA and per-site rarefaction
+# ==============================================================================
+# Assigns each observation to its NEAREST site anchor (within site_max_dist_m)
+# and builds three figures. Everything here works on TAXON, not species rank:
+# the composition figures use iconic_taxon, and the rarefaction accumulates
+# distinct taxon_id at ANY rank. That is deliberate - filtering to
+# taxon_rank == "species" throws away roughly half the records and guts the
+# smaller sites.
+# Expects: obs, slides_dir, theme_bioblitz(), iconic_cols, chart_fig_width/height,
+#          plot_title_size, force_rebuild, n_permutations, step_size
+# ==============================================================================
+
+if (isTRUE(include_sites)) {
+  cat("\n=== SITE GROUPING ===\n")
+
+  # --- read the site anchors --------------------------------------------------
+  read_sites_csv <- function(path) {
+    df <- readr::read_csv(path, show_col_types = FALSE) |> janitor::clean_names()
+    nm <- names(df)
+    site_col <- nm[nm %in% c("site", "name", "site_name", "location")][1]
+    lat_col  <- nm[nm %in% c("lat", "latitude", "y")][1]
+    lon_col  <- nm[nm %in% c("lon", "long", "lng", "longitude", "x")][1]
+    if (any(is.na(c(site_col, lat_col, lon_col))))
+      stop("sites_csv needs columns for site, lat and lon (found: ",
+           paste(nm, collapse = ", "), ")")
+    tibble::tibble(site = as.character(df[[site_col]]),
+                   lat  = as.numeric(df[[lat_col]]),
+                   lon  = as.numeric(df[[lon_col]]))
+  }
+
+  # Each leaf Folder = one site. Its Points are the anchors; if a folder holds
+  # only tracks (a trapping line, say), fall back to the LineString vertices so
+  # the site is still represented.
+  read_sites_kml <- function(path) {
+    kml <- path
+    if (grepl("\\.kmz$", path, ignore.case = TRUE)) {
+      td <- file.path(tempdir(), "bb_kmz"); unlink(td, recursive = TRUE)
+      dir.create(td, recursive = TRUE, showWarnings = FALSE)
+      utils::unzip(path, exdir = td)
+      cand <- list.files(td, pattern = "\\.kml$", recursive = TRUE, full.names = TRUE)
+      if (!length(cand)) stop("no .kml found inside ", basename(path))
+      kml <- cand[1]
+    }
+    doc <- xml2::read_xml(kml); xml2::xml_ns_strip(doc)
+    folders <- xml2::xml_find_all(doc, "//Folder[not(.//Folder)]")
+    if (!length(folders)) stop("no site folders found in ", basename(kml))
+    out <- purrr::map_dfr(folders, function(f) {
+      nm <- xml2::xml_text(xml2::xml_find_first(f, "./name"))
+      cs <- xml2::xml_text(xml2::xml_find_all(f, ".//Point/coordinates"))
+      if (!length(cs)) cs <- xml2::xml_text(xml2::xml_find_all(f, ".//LineString/coordinates"))
+      if (!length(cs)) return(NULL)
+      toks <- unlist(strsplit(trimws(paste(cs, collapse = " ")), "[[:space:]]+"))
+      toks <- toks[nzchar(toks)]
+      xy <- do.call(rbind, lapply(strsplit(toks, ","), function(p) {
+        if (length(p) < 2) return(NULL)
+        data.frame(lon = as.numeric(p[1]), lat = as.numeric(p[2]))
+      }))
+      if (is.null(xy)) return(NULL)
+      tibble::tibble(site = trimws(nm), lat = xy$lat, lon = xy$lon)
+    })
+    out
+  }
+
+  site_anchors <- tryCatch({
+    if (nzchar(sites_csv) && file.exists(sites_csv)) {
+      cat("Reading sites from CSV:", sites_csv, "\n"); read_sites_csv(sites_csv)
+    } else if (nzchar(sites_kmz) && file.exists(sites_kmz)) {
+      cat("Reading sites from KML/KMZ:", sites_kmz, "\n")
+      if (!requireNamespace("xml2", quietly = TRUE)) stop("xml2 not installed")
+      read_sites_kml(sites_kmz)
+    } else {
+      stop("set sites_csv or sites_kmz to an existing file")
+    }
+  }, error = function(e) { cat("  Site file problem:", conditionMessage(e), "\n"); NULL })
+
+  if (!is.null(site_anchors)) {
+    site_anchors <- site_anchors |>
+      dplyr::filter(!is.na(lat), !is.na(lon), nzchar(site))
+  }
+
+  if (is.null(site_anchors) || nrow(site_anchors) == 0) {
+    cat("  No usable site anchors - skipping the site module.\n")
+  } else {
+    n_sites_in <- length(unique(site_anchors$site))
+    cat("  ", nrow(site_anchors), "anchors across", n_sites_in, "sites\n")
+
+    # --- assign each observation to its nearest anchor -------------------------
+    obs_xy <- obs |> dplyr::filter(!is.na(longitude), !is.na(latitude))
+    o_sf <- sf::st_as_sf(obs_xy, coords = c("longitude", "latitude"), crs = 4326,
+                         remove = FALSE)
+    a_sf <- sf::st_as_sf(site_anchors, coords = c("lon", "lat"), crs = 4326)
+    # metres, not degrees: project both to Web Mercator scaled at this latitude
+    o_m <- sf::st_transform(o_sf, 3857); a_m <- sf::st_transform(a_sf, 3857)
+    merc_scale <- cos(hq_lat * pi / 180)   # 3857 exaggerates distance by 1/cos(lat)
+    idx <- sf::st_nearest_feature(o_m, a_m)
+    dmin <- as.numeric(sf::st_distance(o_m, a_m[idx, ], by_element = TRUE)) * merc_scale
+
+    obs_site <- obs_xy |>
+      dplyr::mutate(
+        site_raw = site_anchors$site[idx],
+        site_dist_m = dmin,
+        site = ifelse(dmin <= site_max_dist_m, site_raw, NA_character_)
+      )
+
+    # sensitivity table: is site_max_dist_m a sensible cut?
+    cat("\n  Unassigned rate vs cutoff (pick a value where this stops falling fast):\n")
+    for (cut in c(250, 500, 750, 1000, 1500, 2000)) {
+      k <- sum(dmin <= cut)
+      cat(sprintf("    %5dm  assigned %5d   unassigned %5d  (%4.1f%%)\n",
+                  cut, k, nrow(obs_site) - k, 100 * (nrow(obs_site) - k) / nrow(obs_site)))
+    }
+    n_ass <- sum(!is.na(obs_site$site))
+    cat("\n  Using", site_max_dist_m, "m ->", n_ass, "assigned,",
+        nrow(obs_site) - n_ass, "elsewhere\n")
+
+    site_n <- obs_site |> dplyr::filter(!is.na(site)) |>
+      dplyr::count(site, name = "n_obs")
+    keep_sites <- site_n$site[site_n$n_obs >= site_min_obs]
+    cat("  ", length(keep_sites), "of", nrow(site_n), "sites have >=", site_min_obs,
+        "observations\n")
+
+    short <- function(x) ifelse(nchar(x) > site_label_max,
+                                paste0(substr(x, 1, site_label_max - 1), "\u2026"), x)
+    # keep an optional leading "N." then at most two words (for the scatter/PCoA/
+    # rarefaction/equal-effort labels, which have no room for full names)
+    two_words <- function(x) {
+      pre  <- ifelse(grepl("^[0-9]+\\.", x), sub("^([0-9]+\\.[[:space:]]*).*$", "\\1", x), "")
+      body <- sub("^[0-9]+\\.[[:space:]]*", "", x)
+      w    <- vapply(strsplit(body, "[[:space:]]+"),
+                     function(t) paste(utils::head(t, 2), collapse = " "), character(1))
+      paste0(pre, w)
+    }
+    ELSE_LAB <- "Elsewhere (unassigned)"
+    have_repel <- requireNamespace("ggrepel", quietly = TRUE)
+
+    # --- per-site richness + completeness stats (Good-Turing) -----------------
+    # coverage / new-taxon probability use the same distinct-taxon_id-at-any-rank
+    # basis as the accumulation curve. Feeds the scatter (slide A) and the
+    # equal-effort bar (slide C).
+    site_tax <- obs_site |> dplyr::filter(!is.na(site), !is.na(taxon_id))
+    gt_stats <- function(ids) {
+      n <- length(ids); cnt <- table(ids); S <- length(cnt)
+      f1 <- sum(cnt == 1); f2 <- sum(cnt == 2)
+      cover <- if (f1 > 0 && n > 1)
+        1 - (f1 / n) * ((n - 1) * f1 / ((n - 1) * f1 + 2 * max(f2, 1))) else 1
+      tibble::tibble(n_obs = n, n_taxa = S,
+                     new_p = if (n > 0) 100 * f1 / n else 0,
+                     coverage = 100 * cover)
+    }
+    site_stats <- site_tax |> dplyr::group_by(site) |>
+      dplyr::group_modify(~ gt_stats(.x$taxon_id)) |> dplyr::ungroup()
+
+    # richness rarefied to a common effort = the smallest KEPT site (analytic
+    # Hurlbert; lchoose keeps it stable for large n)
+    rarefy_to <- function(ids, m) {
+      cnt <- as.numeric(table(ids)); n <- sum(cnt)
+      if (m > n) return(NA_real_)
+      sum(1 - exp(lchoose(n - cnt, m) - lchoose(n, m)))
+    }
+    base_n <- if (length(keep_sites))
+      min(site_stats$n_obs[site_stats$site %in% keep_sites]) else NA_integer_
+    if (!is.na(base_n)) {
+      std_tbl <- site_tax |> dplyr::filter(site %in% keep_sites) |>
+        dplyr::group_by(site) |>
+        dplyr::group_modify(~ tibble::tibble(rich_std = rarefy_to(.x$taxon_id, base_n))) |>
+        dplyr::ungroup()
+      site_stats <- dplyr::left_join(site_stats, std_tbl, by = "site")
+    } else site_stats$rich_std <- NA_real_
+
+    # plant-dominated vs mixed, reused for point colour on A and C
+    grp_tbl <- obs_site |> dplyr::filter(!is.na(site)) |>
+      dplyr::group_by(site) |>
+      dplyr::summarise(plant_pct = 100 * mean(iconic_taxon == "Plantae", na.rm = TRUE),
+                       .groups = "drop") |>
+      dplyr::mutate(grp = ifelse(plant_pct >= 70, "Plant-dominated", "Mixed / diverse"))
+    site_stats <- dplyr::left_join(site_stats, grp_tbl, by = "site")
+    grp_pal <- c("Plant-dominated" = "#4C7A5D", "Mixed / diverse" = "#EBCC2A")
+
+    # non-overlapping site labels (ggrepel if available, else plain text)
+    site_label_layer <- function(df, xcol, ycol, lab_colour = "#F7FAFC") {
+      aes_lab <- ggplot2::aes(x = .data[[xcol]], y = .data[[ycol]], label = two_words(site))
+      if (have_repel) {
+        ggrepel::geom_text_repel(data = df, mapping = aes_lab, size = 6.2,
+          fontface = "bold", colour = lab_colour, box.padding = 0.9,
+          point.padding = 0.5, min.segment.length = 0, segment.colour = "#5a6b78",
+          segment.size = 0.3, max.overlaps = Inf, seed = 7, show.legend = FALSE)
+      } else {
+        ggplot2::geom_text(data = df, mapping = aes_lab, size = 6.2, fontface = "bold",
+          colour = lab_colour, vjust = -1.3, show.legend = FALSE)
+      }
+    }
+
+    # ==========================================================================
+    # FIGURE A: taxon composition per site (horizontal stacked bars)
+    # ==========================================================================
+    figA <- file.path(slides_dir, "fig_site_composition.png")
+    if (force_rebuild || !file.exists(figA)) {
+      cat("  Building site composition figure...\n")
+      tryCatch({
+        comp_dat <- obs_site |>
+          dplyr::mutate(grp = ifelse(is.na(site), ELSE_LAB, site)) |>
+          dplyr::filter(grp != ELSE_LAB | isTRUE(site_show_elsewhere)) |>
+          dplyr::mutate(iconic_taxon = ifelse(is.na(iconic_taxon) | !nzchar(iconic_taxon),
+                                              "Unknown", iconic_taxon)) |>
+          dplyr::count(grp, iconic_taxon, name = "n") |>
+          dplyr::group_by(grp) |>
+          dplyr::mutate(pct = 100 * n / sum(n), n_site = sum(n)) |>
+          dplyr::ungroup()
+
+        # order sites by % plants, with Elsewhere pinned to the bottom as reference
+        plant_pct <- comp_dat |>
+          dplyr::filter(iconic_taxon == "Plantae") |>
+          dplyr::select(grp, pp = pct)
+        ord <- comp_dat |> dplyr::distinct(grp, n_site) |>
+          dplyr::left_join(plant_pct, by = "grp") |>
+          dplyr::mutate(pp = ifelse(is.na(pp), 0, pp),
+                        is_else = grp == ELSE_LAB) |>
+          dplyr::arrange(is_else, pp)
+        comp_dat <- comp_dat |>
+          dplyr::mutate(grp = factor(grp, levels = ord$grp))
+
+        lab_map <- setNames(
+          paste0(two_words(as.character(ord$grp)), "  (", ord$n_site, ")"), ord$grp)
+        # sites below the threshold are greyed, not hidden - the reader sees them
+        # and sees why they are not in the other two figures
+        faint <- ord$grp[ord$n_site < site_min_obs & !ord$is_else]
+
+        tax_lv <- comp_dat |> dplyr::group_by(iconic_taxon) |>
+          dplyr::summarise(t = sum(n), .groups = "drop") |>
+          dplyr::arrange(dplyr::desc(t)) |> dplyr::pull(iconic_taxon)
+        comp_dat <- comp_dat |>
+          dplyr::mutate(iconic_taxon = factor(iconic_taxon, levels = rev(tax_lv)))
+
+        pal <- iconic_cols[levels(comp_dat$iconic_taxon)]
+        pal[is.na(pal)] <- "#888780"
+        names(pal) <- levels(comp_dat$iconic_taxon)
+
+        pA <- ggplot2::ggplot(comp_dat,
+                ggplot2::aes(x = pct, y = grp, fill = iconic_taxon)) +
+          ggplot2::geom_col(width = 0.82, colour = "#040a11", linewidth = 0.3) +
+          ggplot2::scale_fill_manual(values = pal, name = NULL,
+                                     guide = ggplot2::guide_legend(reverse = TRUE, ncol = 1)) +
+          ggplot2::scale_y_discrete(labels = lab_map) +
+          ggplot2::scale_x_continuous(expand = c(0, 0), breaks = c(0, 25, 50, 75, 100),
+                                      labels = function(x) paste0(x, "%")) +
+          ggplot2::labs(title = NULL, x = "Percent of the observations at that site", y = NULL) +
+          theme_bioblitz() +
+          ggplot2::theme(panel.grid.major.y = ggplot2::element_blank(),
+                         legend.text   = ggplot2::element_text(size = 22),
+                         legend.key    = ggplot2::element_rect(fill = NA, colour = NA),
+                         legend.key.height = grid::unit(2.9, "lines"),
+                         legend.key.width  = grid::unit(1.6, "lines"),
+                         legend.spacing.y  = grid::unit(0.9, "lines"),
+                         axis.text.y = ggplot2::element_text(hjust = 1))
+        # wide landscape aspect: the deck shows figures at a fixed HEIGHT, so a
+        # wide figure fills the slide width instead of sitting in a narrow strip
+        ggplot2::ggsave(figA, pA, width = 19, height = 10,
+                        dpi = 300, bg = "#040a11")
+        cat("    saved fig_site_composition.png\n")
+      }, error = function(e) cat("    composition figure failed:", conditionMessage(e), "\n"))
+    }
+
+    # ==========================================================================
+    # FIGURE B: PCoA of sites by taxon composition (Bray-Curtis)
+    # ==========================================================================
+    figB <- file.path(slides_dir, "fig_site_pcoa.png")
+    if ((force_rebuild || !file.exists(figB)) && length(keep_sites) >= 4) {
+      cat("  Building site PCoA...\n")
+      tryCatch({
+        wide <- obs_site |>
+          dplyr::filter(site %in% keep_sites) |>
+          dplyr::mutate(iconic_taxon = ifelse(is.na(iconic_taxon) | !nzchar(iconic_taxon),
+                                              "Unknown", iconic_taxon)) |>
+          dplyr::count(site, iconic_taxon, name = "n") |>
+          tidyr::pivot_wider(names_from = iconic_taxon, values_from = n, values_fill = 0)
+        M <- as.matrix(wide[, -1, drop = FALSE])
+        rownames(M) <- wide$site
+        P <- M / rowSums(M)            # proportions: removes the effort signal
+
+        # Bray-Curtis. On proportions each row sums to 1, so this reduces to
+        # half the total absolute difference, but keep the general form.
+        nS <- nrow(P); D <- matrix(0, nS, nS)
+        for (i in seq_len(nS)) for (j in seq_len(nS))
+          D[i, j] <- sum(abs(P[i, ] - P[j, ])) / sum(P[i, ] + P[j, ])
+        dimnames(D) <- list(rownames(P), rownames(P))
+
+        pc <- stats::cmdscale(stats::as.dist(D), k = 2, eig = TRUE)
+        ev <- pc$eig[pc$eig > 0]; ve <- round(100 * ev / sum(ev))
+
+        pts <- tibble::tibble(
+          site = rownames(P), x = pc$points[, 1], y = pc$points[, 2],
+          n_obs = as.numeric(rowSums(M)),
+          plant_pct = 100 * P[, match("Plantae", colnames(P))]
+        ) |>
+          dplyr::mutate(plant_pct = ifelse(is.na(plant_pct), 0, plant_pct),
+                        grp = ifelse(plant_pct >= 70, "Plant-dominated", "Mixed / diverse"))
+
+        # taxon arrows: correlation of each taxon proportion with the two axes.
+        # Not a formal biplot - a readable gradient guide.
+        arr <- purrr::map_dfr(colnames(P), function(t) {
+          v <- P[, t]
+          if (stats::sd(v) == 0) return(NULL)
+          tibble::tibble(taxon = t,
+                         ax = stats::cor(pts$x, v), ay = stats::cor(pts$y, v))
+        }) |> dplyr::filter(pmax(abs(ax), abs(ay)) > 0.45)
+        sc <- 0.7 * max(abs(c(pts$x, pts$y))) / max(abs(c(arr$ax, arr$ay)), na.rm = TRUE)
+        # colour the taxon arrows with the SAME palette the other plots use
+        arr_cols <- iconic_cols[arr$taxon]; arr_cols[is.na(arr_cols)] <- "#B8C4CE"
+        names(arr_cols) <- arr$taxon
+        # taxon labels repel too, so site names and vector labels avoid each other
+        taxon_lab_layer <- if (have_repel)
+          ggrepel::geom_text_repel(data = arr,
+            ggplot2::aes(x = ax * sc * 1.12, y = ay * sc * 1.12, label = taxon, colour = taxon),
+            size = 6.4, fontface = "bold", box.padding = 0.5, point.padding = 0.2,
+            min.segment.length = Inf, max.overlaps = Inf, seed = 7, show.legend = FALSE)
+        else
+          ggplot2::geom_text(data = arr,
+            ggplot2::aes(x = ax * sc * 1.12, y = ay * sc * 1.12, label = taxon, colour = taxon),
+            size = 6.4, fontface = "bold", show.legend = FALSE)
+
+        pB <- ggplot2::ggplot() +
+          ggplot2::geom_hline(yintercept = 0, colour = "#2c3a4a", linetype = "dashed") +
+          ggplot2::geom_vline(xintercept = 0, colour = "#2c3a4a", linetype = "dashed") +
+          ggplot2::geom_segment(data = arr,
+            ggplot2::aes(x = 0, y = 0, xend = ax * sc, yend = ay * sc, colour = taxon),
+            linewidth = 0.9, arrow = grid::arrow(length = grid::unit(0.22, "cm")),
+            show.legend = FALSE) +
+          taxon_lab_layer +
+          ggplot2::scale_colour_manual(values = arr_cols, guide = "none") +
+          ggplot2::geom_point(data = pts,
+            ggplot2::aes(x = x, y = y, size = n_obs, fill = grp),
+            shape = 21, colour = "#040a11", alpha = 0.85, stroke = 0.8) +
+          ggplot2::scale_size_area(max_size = 16, name = "Observations",
+            # without this the size-legend keys inherit no fill and vanish on the
+            # dark background - force a visible neutral disc
+            guide = ggplot2::guide_legend(
+              override.aes = list(fill = "#B8C4CE", colour = "#040a11",
+                                  shape = 21, stroke = 0.8))) +
+          ggplot2::scale_fill_manual(values = grp_pal, name = NULL,
+            guide = ggplot2::guide_legend(
+              override.aes = list(size = 6, shape = 21, colour = "#040a11"))) +
+          site_label_layer(pts, "x", "y") +
+          ggplot2::labs(
+            x = paste0("Axis 1 (", ve[1], "%)"),
+            y = paste0("Axis 2 (", ve[2], "%)")) +
+          ggplot2::coord_cartesian(clip = "off") +
+          theme_bioblitz()
+        ggplot2::ggsave(figB, pB, width = chart_fig_width + 3, height = chart_fig_height + 1,
+                        dpi = 300, bg = "#040a11")
+        cat("    saved fig_site_pcoa.png (axes 1+2 = ", ve[1] + ve[2], "% of variation)\n", sep = "")
+      }, error = function(e) cat("    PCoA failed:", conditionMessage(e), "\n"))
+    }
+
+    # ==========================================================================
+    # FIGURE C: per-site rarefaction (taxon accumulation, ALL ranks)
+    # ==========================================================================
+    figC <- file.path(slides_dir, "fig_site_rarefaction.png")
+    if ((force_rebuild || !file.exists(figC)) && length(keep_sites) >= 2) {
+      cat("  Building per-site rarefaction (", n_permutations, " permutations)...\n", sep = "")
+      tryCatch({
+        rare_dat <- obs_site |>
+          dplyr::filter(site %in% keep_sites, !is.na(taxon_id))
+
+        # accumulate distinct taxon_id at ANY rank - see the module note above
+        curve_one <- function(df, step) {
+          nn <- nrow(df)
+          steps <- unique(c(seq(step, nn, by = step), nn))
+          purrr::map_dfr(seq_len(n_permutations), function(perm) {
+            sh <- df[sample(nn), ]
+            purrr::map_dfr(steps, function(k) {
+              tibble::tibble(n_observations = k,
+                             n_taxa = dplyr::n_distinct(sh$taxon_id[1:k]),
+                             permutation = perm)
+            })
+          })
+        }
+
+        set.seed(42)
+        site_curves <- purrr::map_dfr(sort(keep_sites), function(s) {
+          d <- rare_dat |> dplyr::filter(site == s)
+          if (nrow(d) < 10) return(NULL)
+          st <- max(1, floor(nrow(d) / 40))   # ~40 points per curve regardless of n
+          curve_one(d, st) |>
+            dplyr::group_by(n_observations) |>
+            dplyr::summarise(mean_taxa = mean(n_taxa),
+                             lo = stats::quantile(n_taxa, 0.025),
+                             hi = stats::quantile(n_taxa, 0.975),
+                             .groups = "drop") |>
+            dplyr::mutate(site = s)
+        })
+
+        ends <- site_curves |> dplyr::group_by(site) |>
+          dplyr::filter(n_observations == max(n_observations)) |> dplyr::ungroup()
+
+        # tracking-line layout: a dashed horizontal from each curve's end runs
+        # to a common right gutter, then ggrepel stacks the names in a tidy
+        # column there instead of piling them onto the curves
+        x_max <- max(site_curves$n_observations)
+        gutter <- x_max * 1.02
+        end_lab <- ends |> dplyr::mutate(gx = gutter)
+
+        lab_layer <- if (have_repel)
+          ggrepel::geom_text_repel(data = end_lab,
+            ggplot2::aes(x = gx, y = mean_taxa, label = two_words(site), colour = site),
+            hjust = 0, direction = "y", size = 6, fontface = "bold", xlim = c(gutter, NA),
+            segment.colour = "#5a6b78", segment.size = 0.3, min.segment.length = 0,
+            box.padding = 0.28, max.overlaps = Inf, seed = 7, show.legend = FALSE)
+        else
+          ggplot2::geom_text(data = end_lab,
+            ggplot2::aes(x = gx, y = mean_taxa, label = two_words(site), colour = site),
+            hjust = 0, size = 5.4, fontface = "bold", show.legend = FALSE)
+
+        pC <- ggplot2::ggplot(site_curves,
+                ggplot2::aes(x = n_observations, y = mean_taxa,
+                             group = site, colour = site)) +
+          ggplot2::geom_ribbon(ggplot2::aes(ymin = lo, ymax = hi, fill = site),
+                               alpha = 0.12, colour = NA) +
+          ggplot2::geom_line(linewidth = 1.1) +
+          ggplot2::geom_segment(data = ends,
+            ggplot2::aes(x = n_observations, xend = gutter,
+                         y = mean_taxa, yend = mean_taxa, colour = site),
+            linetype = "dashed", linewidth = 0.4, alpha = 0.55) +
+          ggplot2::geom_point(data = ends, size = 2.6) +
+          lab_layer +
+          ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = c(0.01, 0.40))) +
+          ggplot2::labs(x = "Observations", y = "Distinct taxa recorded") +
+          ggplot2::coord_cartesian(clip = "off") +
+          theme_bioblitz() +
+          ggplot2::theme(legend.position = "none")
+        ggplot2::ggsave(figC, pC, width = chart_fig_width + 3, height = chart_fig_height + 1,
+                        dpi = 300, bg = "#040a11")
+        cat("    saved fig_site_rarefaction.png\n")
+      }, error = function(e) cat("    rarefaction failed:", conditionMessage(e), "\n"))
+    }
+
+    # ==========================================================================
+    # FIGURE D (slide A): richness vs completeness scatter
+    # ==========================================================================
+    figD <- file.path(slides_dir, "fig_site_completeness_scatter.png")
+    if (force_rebuild || !file.exists(figD)) {
+      cat("  Building richness-vs-completeness scatter...\n")
+      tryCatch({
+        sc_dat <- site_stats |> dplyr::mutate(sparse = n_obs < site_min_obs)
+        mx <- stats::median(sc_dat$coverage); my <- stats::median(sc_dat$n_taxa)
+        xr <- range(sc_dat$coverage, na.rm = TRUE); yr <- range(sc_dat$n_taxa, na.rm = TRUE)
+        yspan <- diff(yr)
+        quad <- tibble::tibble(   # top labels sit up near the top edge, clear of the points
+          x = c(xr[2], xr[1], xr[1], xr[2]),
+          y = c(yr[2] + yspan * 0.13, yr[2] + yspan * 0.13, yr[1], yr[1]),
+          h = c(1, 0, 0, 1), v = c(1, 1, 1, 1),
+          lab = c("rich + well sampled", "rich, more to find", "sparse", "species-poor"))
+
+        pD <- ggplot2::ggplot(sc_dat,
+                ggplot2::aes(x = coverage, y = n_taxa)) +
+          ggplot2::annotate("rect", xmin = mx, xmax = Inf, ymin = my, ymax = Inf,
+                            fill = "#12331f", alpha = 0.35) +
+          ggplot2::geom_vline(xintercept = mx, linetype = "dashed", colour = "#2c3a4a") +
+          ggplot2::geom_hline(yintercept = my, linetype = "dashed", colour = "#2c3a4a") +
+          ggplot2::geom_text(data = quad, ggplot2::aes(x = x, y = y, label = lab),
+            hjust = quad$h, vjust = quad$v, fontface = "bold.italic",
+            colour = "#8FB0C4", size = 6.4, inherit.aes = FALSE) +
+          ggplot2::geom_point(ggplot2::aes(size = n_obs, fill = grp, alpha = sparse),
+                              shape = 21, colour = "#040a11", stroke = 0.8) +
+          site_label_layer(sc_dat, "coverage", "n_taxa") +
+          ggplot2::scale_size_area(max_size = 17, name = "Observations",
+            guide = ggplot2::guide_legend(
+              override.aes = list(fill = "#B8C4CE", colour = "#040a11", shape = 21))) +
+          ggplot2::scale_fill_manual(values = grp_pal, name = NULL,
+            guide = ggplot2::guide_legend(
+              override.aes = list(size = 6, shape = 21, colour = "#040a11"))) +
+          ggplot2::scale_alpha_manual(values = c("FALSE" = 0.85, "TRUE" = 0.4),
+                                      guide = "none") +
+          ggplot2::scale_x_continuous(labels = function(x) paste0(x, "%"),
+                                      expand = ggplot2::expansion(mult = 0.08)) +
+          ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0.05, 0.18))) +
+          ggplot2::labs(x = "Estimated completeness  (% of taxa found)",
+                        y = "Taxa recorded") +
+          ggplot2::coord_cartesian(clip = "off") +
+          theme_bioblitz() +
+          ggplot2::theme(panel.grid = ggplot2::element_blank())
+        ggplot2::ggsave(figD, pD, width = chart_fig_width + 3, height = chart_fig_height + 1,
+                        dpi = 300, bg = "#040a11")
+        cat("    saved fig_site_completeness_scatter.png\n")
+      }, error = function(e) cat("    scatter failed:", conditionMessage(e), "\n"))
+    }
+
+    # ==========================================================================
+    # FIGURE E (slide C): richness at equal effort (rarefied to base_n)
+    # ==========================================================================
+    figE <- file.path(slides_dir, "fig_site_richness_std.png")
+    if ((force_rebuild || !file.exists(figE)) && !is.na(base_n)) {
+      cat("  Building equal-effort richness bar (base n = ", base_n, ")...\n", sep = "")
+      tryCatch({
+        std_dat <- site_stats |> dplyr::filter(!is.na(rich_std)) |>
+          dplyr::mutate(site = two_words(site),
+                        site = forcats::fct_reorder(site, rich_std))
+        pE <- ggplot2::ggplot(std_dat,
+                ggplot2::aes(x = rich_std, y = site, fill = grp)) +
+          ggplot2::geom_col(width = 0.74, colour = "#040a11", linewidth = 0.3) +
+          ggplot2::geom_text(ggplot2::aes(label = round(rich_std)),
+                             hjust = -0.25, colour = "#CBD5E0", size = 5) +
+          ggplot2::scale_fill_manual(values = grp_pal, name = NULL) +
+          ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = c(0, 0.10))) +
+          ggplot2::labs(x = paste0("Taxa per ", base_n, " observations (equal effort)"),
+                        y = NULL) +
+          theme_bioblitz() +
+          ggplot2::theme(panel.grid.major.y = ggplot2::element_blank())
+        ggplot2::ggsave(figE, pE, width = 16, height = 10, dpi = 300, bg = "#040a11")
+        cat("    saved fig_site_richness_std.png\n")
+      }, error = function(e) cat("    equal-effort bar failed:", conditionMessage(e), "\n"))
+    }
+
+    # a curve still climbing steeply = that site had more to find
+    site_summary <- obs_site |>
+      dplyr::filter(!is.na(site)) |>
+      dplyr::group_by(site) |>
+      dplyr::summarise(n_obs = dplyr::n(),
+                       n_taxa = dplyr::n_distinct(taxon_id), .groups = "drop") |>
+      dplyr::arrange(dplyr::desc(n_obs))
+    readr::write_csv(site_summary, file.path(slides_dir, "site_summary.csv"))
+    cat("  Wrote site_summary.csv\n")
+  }
+}
+
+# ==============================================================================
 # CUSTOM CSS FOR PRESENTATION
 # ==============================================================================
 
@@ -2646,6 +3381,45 @@ css_content <- paste0('
 
 .reveal .slides {
   text-align: center;
+}
+
+/* --- PDF export (Chrome print view; add ?print-pdf to the URL) ---------------
+   FIGURE HEIGHT. On screen the figure uses viewport units (84vh), which measure
+   the browser window; reveal then scales the whole 1600x900 slide to fit, so it
+   looks right. In print each slide is a fixed 900px page and vh no longer
+   tracks it, so the figure must be capped in px AND must leave room for the
+   heading (~101px at 88px type) and, where present, the subtitle (~60px at 44px
+   type - it is position:static, so it DOES take vertical space).
+   If the figure does not fit in what is left, Chrome does NOT clip it: images
+   are atomic in paged media, so it moves the WHOLE figure to the next page, and
+   reveal hides that (overflow:hidden on .pdf-page). The figure vanishes.
+   That is why a 756px cap lost the figure on every subtitled slide
+   (101 + 60 + 756 = 917 > 900) while unsubtitled slides survived (101 + 756 =
+   857 < 900). 700px leaves ~40px of headroom in the worst case, and height:auto
+   lets the figure scale down instead of overflowing.
+   BACKGROUNDS are forced here too: the deck stacks a LIGHT theme (simple) under
+   night, and the reveal print stylesheet is injected at runtime, so either can
+   reassert a pale background on the printed page. */
+@media print {
+  html, body, .reveal, .reveal-viewport {
+    background: #040a11 !important;
+  }
+  /* Give every printed page its own copy of the radial gradient. On screen you
+     see one slide filling the viewport with that gradient, so a per-page copy
+     is what matches the HTML; leaving the gradient on .reveal-viewport would
+     stretch ONE gradient down the whole stack of pages and give each page a
+     thin slice of it. */
+  .reveal .slides section {
+    background: radial-gradient(ellipse at 60% 40%, #0b1b2a 0%, #040a11 60%, #000 100%) !important;
+  }
+  .reveal img,
+  .reveal section img {
+    height: auto !important;
+    max-height: 700px !important;
+    width: auto !important;
+    max-width: 100% !important;
+    box-shadow: none !important;
+  }
 }
 ')
 
@@ -2959,14 +3733,16 @@ if (force_rebuild || !file.exists(rank_ab_path)) {
   rare_msg   <- if (pct_single >= 40) "most species are rare" else
                 if (pct_single >= 20) "many species are rare" else
                 "abundance is relatively even"
+  rank_lab <- tibble::tibble(x = Inf, y = max(sp$n),
+    label = sprintf("%d species<br>%d seen once (%.0f%%)<br><span style='color:#EBCC2A'>**%s**</span>",
+                    nrow(sp), singles, pct_single, rare_msg))
   p_plain <- ggplot2::ggplot(sp, ggplot2::aes(rank, n)) +
     ggplot2::geom_area(fill = "#228B22", alpha = 0.22) +
     ggplot2::geom_line(colour = INK, linewidth = 0.7) +
     ggplot2::scale_y_log10() +
-    ggplot2::annotate("label", x = Inf, y = max(sp$n), hjust = 1.05, vjust = 1,
-      label = sprintf("%d species\n%d seen once (%.0f%%)\n%s",
-                      nrow(sp), singles, pct_single, rare_msg),
-      fill = "#0b1b2a", colour = INK) +
+    ggtext::geom_richtext(data = rank_lab, ggplot2::aes(x = x, y = y, label = label),
+      hjust = 1.05, vjust = 1, fill = "#0b1b2a", label.colour = NA,
+      colour = INK, size = 11, inherit.aes = FALSE) +
     ggplot2::labs(x = "Species rank (commonest to rarest)", y = "Observations (log)") +
     theme_bioblitz()
   ggplot2::ggsave(rank_ab_path, p_plain, width = 16, height = 8, dpi = 300, bg = "#040a11")
@@ -3103,6 +3879,23 @@ cat("=== SPECIES SHOWCASE MODULE COMPLETE ===\n\n")
 cat("=== GENERATING QUARTO PRESENTATION ===\n")
 
 # Check if logo exists to determine title slide format
+# Site slides are only wired in if the module actually produced its figures
+site_slides_md <- ""
+if (isTRUE(include_sites)) {
+  .sf1 <- file.exists(file.path(slides_dir, "fig_site_composition.png"))
+  .sf2 <- file.exists(file.path(slides_dir, "fig_site_pcoa.png"))
+  .sf3 <- file.exists(file.path(slides_dir, "fig_site_rarefaction.png"))
+  .sf4 <- file.exists(file.path(slides_dir, "fig_site_completeness_scatter.png"))
+  .sf5 <- file.exists(file.path(slides_dir, "fig_site_richness_std.png"))
+  site_slides_md <- paste0(
+    if (.sf1) "## Sites: What Each Group Found\n\n::: {.slide-subtitle}\ntaxon mix at each survey site\n:::\n\n![](fig_site_composition.png)\n\n" else "",
+    if (.sf2) "## Sites: How They Differ\n\n::: {.slide-subtitle}\nsites near each other found similar things\n:::\n\n![](fig_site_pcoa.png)\n\n" else "",
+    if (.sf3) "## Sites: Was There More to Find?\n\n::: {.slide-subtitle}\ntaxon accumulation per site\n:::\n\n![](fig_site_rarefaction.png)\n\n" else "",
+    if (.sf4) "## Sites: Rich, or Well-Searched?\n\n::: {.slide-subtitle}\ntaxa found vs how completely each was sampled\n:::\n\n![](fig_site_completeness_scatter.png)\n\n" else "",
+    if (.sf5) "## Sites: Richest at Equal Effort\n\n::: {.slide-subtitle}\ntaxa at a common sampling effort\n:::\n\n![](fig_site_richness_std.png)\n\n")
+  cat("Site slides wired in:", sum(.sf1, .sf2, .sf3, .sf4, .sf5), "of 5\n")
+}
+
 logo_exists <- file.exists(bioblitz_logo)
 cat("Logo file check:", if(logo_exists) "FOUND" else "NOT FOUND", "\n")
 cat("  Path checked:", bioblitz_logo, "\n")
@@ -3125,10 +3918,17 @@ if (isTRUE(include_awards)) {
   }
   award_photo <- function(login, icon_url) {
     if (is.na(login) || is.na(icon_url) || !nzchar(icon_url)) return(NA_character_)
-    out <- file.path(award_dir, paste0("obs_", gsub("[^A-Za-z0-9_-]", "_", login), ".png"))
+    out  <- file.path(award_dir, paste0("obs_", gsub("[^A-Za-z0-9_-]", "_", login), ".png"))
+    fail <- paste0(out, ".fail")
     if (file.exists(out) && !isTRUE(force_refetch_photos)) return(out)
+    # a URL that already failed once is remembered, so we do not wait on it every
+    # run (delete the .fail marker, or set force_refetch_photos, to retry)
+    if (file.exists(fail) && !isTRUE(force_refetch_photos)) return(NA_character_)
     ok <- tryCatch({
-      raw <- httr2::resp_body_raw(httr2::req_perform(httr2::request(icon_url)))
+      # req_timeout is essential: without it a slow or dead icon URL blocks the
+      # whole script indefinitely, which looks like a hang in the awards section
+      raw <- httr2::resp_body_raw(httr2::req_perform(
+               httr2::req_timeout(httr2::request(icon_url), 15)))
       img <- magick::image_crop(magick::image_scale(magick::image_read(raw), "400x400^"),
                                 "400x400+0+0", gravity = "center")
       mask <- magick::image_read_svg('<svg width="400" height="400"><circle cx="200" cy="200" r="198" fill="white"/></svg>', width = 400, height = 400)
@@ -3137,7 +3937,7 @@ if (isTRUE(include_awards)) {
       img <- magick::image_background(img, "#040a11")   # flatten corners to the (flat) podium background
       magick::image_write(img, out); TRUE
     }, error = function(e) FALSE)
-    if (isTRUE(ok)) out else NA_character_
+    if (isTRUE(ok)) out else { try(file.create(fail), silent = TRUE); NA_character_ }
   }
   render_podium <- function(win, out_path, suffix = "") {
     win <- win[order(win$rank), , drop = FALSE]
@@ -3157,7 +3957,7 @@ if (isTRUE(include_awards)) {
       { if (any(win$rank != 1 & hp)) ggimage::geom_image(data = win[win$rank != 1 & hp, ], ggplot2::aes(image = photo), size = 0.26, asp = 1) } +
       ggplot2::geom_text(ggplot2::aes(x, py + 0.25, label = medal, colour = rcol), fontface = "bold", size = 13) +
       ggplot2::geom_text(ggplot2::aes(x, py - 0.25, label = observer_name), colour = "#F7FAFC", fontface = "bold", size = 18) +
-      ggplot2::geom_text(ggplot2::aes(x, py - 0.32, label = vlab), colour = "#CBD5E0", size = 14) +
+      ggplot2::geom_text(ggplot2::aes(x, py - 0.36, label = vlab), colour = "#9FD0B6", fontface = "bold", size = 14) +
       ggplot2::scale_colour_identity() +
       ggplot2::scale_x_continuous(limits = c(0.4, 3.6)) +
       ggplot2::scale_y_continuous(limits = c(0, 1.0)) +
@@ -3221,6 +4021,14 @@ if (isTRUE(include_awards)) {
   # Which awards to include (edit to a subset once you have picked favourites):
   award_ids <- vapply(specs, function(s) s$id, character(1))   # default = all defined
 
+  # Fallback avatars for winners with no profile photo. Built ONCE here, not per
+  # award: names with no PhyloPic silhouette (Unknown etc.) fail, a failed fetch
+  # is never cached, so re-sweeping per award re-hit the network every time.
+  .avatar_pool  <- setdiff(names(iconic_cols), c("Unknown", "Chromista", "Protozoa"))
+  .avatar_icons <- unlist(lapply(.avatar_pool,
+                     function(t) tryCatch(ensure_taxon_icon(t), error = function(e) NA_character_)))
+  .avatar_icons <- .avatar_icons[!is.na(.avatar_icons) & nzchar(.avatar_icons)]
+
   n_awards <- 0
   for (sp in specs) {
     if (!(sp$id %in% award_ids)) next
@@ -3233,11 +4041,8 @@ if (isTRUE(include_awards)) {
     res$photo <- vapply(seq_len(nrow(res)),
                         function(i) award_photo(res$observer_login[i], res$observer_icon_url[i]), character(1))
     noph <- is.na(res$photo)
-    if (any(noph)) {   # no profile pic -> random taxon silhouette as the avatar
-      ic <- unlist(lapply(sample(names(iconic_cols)), function(t) tryCatch(ensure_taxon_icon(t), error = function(e) NA_character_)))
-      ic <- ic[!is.na(ic) & nzchar(ic)]
-      if (length(ic)) res$photo[noph] <- sample(ic, sum(noph), replace = TRUE)
-    }
+    if (any(noph) && length(.avatar_icons))   # no profile pic -> random taxon silhouette
+      res$photo[noph] <- sample(.avatar_icons, sum(noph), replace = TRUE)
     png <- file.path(slides_dir, paste0("award_", sp$id, ".png"))
     if (force_rebuild || !file.exists(png))
       tryCatch(render_podium(res, png, sp$suffix),
@@ -3311,7 +4116,7 @@ excluding plants
 
 ![](fig_observations_by_taxon.png)
 
-## Top Observers
+', animalia_slide_md, '## Top Observers
 
 ![](fig_top_observers.png)
 
@@ -3354,7 +4159,7 @@ grid-based analysis
 ## Species Richness
 
 ::: {.slide-subtitle}
-species per observation
+probability of a new species per observation
 :::
 
 ![](fig_richness_effort_corrected.png)
@@ -3362,7 +4167,7 @@ species per observation
 ## Species Richness
 
 ::: {.slide-subtitle}
-smooth continuous surface
+probability of a new species per observation (interpolated)
 :::
 
 ![](fig_richness_interpolated.png)
@@ -3407,7 +4212,7 @@ example species, common to rare
 
 ![](fig_species_tiers.png)
 
-', award_slides_md, '## The Big Picture
+', site_slides_md, '', award_slides_md, '## The Big Picture
 
 ![](fig_chart_collage.png)
 
@@ -3463,7 +4268,7 @@ excluding plants
 
 ![](fig_observations_by_taxon.png)
 
-## Top Observers
+', animalia_slide_md, '## Top Observers
 
 ![](fig_top_observers.png)
 
@@ -3559,7 +4364,7 @@ example species, common to rare
 
 ![](fig_species_tiers.png)
 
-', award_slides_md, '## The Big Picture
+', site_slides_md, '', award_slides_md, '## The Big Picture
 
 ![](fig_chart_collage.png)
 ')
@@ -3669,6 +4474,112 @@ if __name__ == "__main__":
     main(sys.argv[1])
 )---"
 
+# ==============================================================================
+# PDF EXPORT HELPER
+# ==============================================================================
+# reveal.js only lays every slide out as its own page when it is in PRINT VIEW,
+# and print view is triggered by the ?print-pdf query string on the URL. Note
+# pagedown::chrome_print() cannot pass one: it treats anything that is not
+# ^https?:// as a file path and runs it through normalizePath(), so the query
+# string is lost and Chrome prints only the current slide. We therefore drive
+# headless Chrome through chromote and navigate to the query URL ourselves.
+#   printBackground   = keeps the navy background (the Background graphics box)
+#   preferCSSPageSize = lets reveal's own @page rule set the 16:9 page size
+# Build a throwaway copy of the deck with downsampled figures, and return the path to
+# its HTML. Only what the deck actually loads is copied (the html, the Quarto libs, the
+# css and the logo), so the photo caches are skipped. The figures are shrunk to fit
+# max_px on the longest edge; the ">" geometry flag means never enlarge a small figure.
+build_pdf_copy <- function(slides_dir, html_file, max_px) {
+  bd <- file.path(slides_dir, "_pdf_build")
+  unlink(bd, recursive = TRUE)
+  dir.create(bd, recursive = TRUE, showWarnings = FALSE)
+  file.copy(html_file, bd, overwrite = TRUE)
+  for (d in list.files(slides_dir, pattern = "_files$", full.names = TRUE))
+    file.copy(d, bd, recursive = TRUE, overwrite = TRUE)
+  if (dir.exists(file.path(slides_dir, "styles")))
+    file.copy(file.path(slides_dir, "styles"), bd, recursive = TRUE, overwrite = TRUE)
+  for (f in list.files(slides_dir, pattern = "\\.(jpg|jpeg)$", ignore.case = TRUE,
+                       full.names = TRUE))
+    file.copy(f, bd, overwrite = TRUE)
+
+  pngs <- list.files(slides_dir, pattern = "\\.png$", ignore.case = TRUE, full.names = TRUE)
+  n <- 0
+  for (p in pngs) {
+    done <- tryCatch({
+      magick::image_write(
+        magick::image_resize(magick::image_read(p), paste0(max_px, "x", max_px, ">")),
+        file.path(bd, basename(p)))
+      TRUE
+    }, error = function(e) FALSE)
+    if (isTRUE(done)) n <- n + 1 else file.copy(p, bd, overwrite = TRUE)   # fall back to full size
+  }
+  cat("    downsampled", n, "of", length(pngs), "figures to", max_px, "px\n")
+  file.path(bd, basename(html_file))
+}
+
+export_deck_pdf <- function(html_file, pdf_file, wait = 6, timeout_s = 300) {
+  if (!requireNamespace("chromote", quietly = TRUE)) {
+    cat("  chromote not installed - skipping PDF. install.packages('chromote')\n")
+    return(FALSE)
+  }
+  if (file.exists(pdf_file)) {
+    can_write <- tryCatch({ con <- file(pdf_file, "w"); close(con); TRUE },
+                          error = function(e) FALSE)
+    if (!can_write) {
+      cat("  WARNING: the existing PDF looks open in another program - close it and re-run.\n")
+      return(FALSE)
+    }
+  }
+  ok <- tryCatch({
+    fp <- normalizePath(html_file, winslash = "/", mustWork = TRUE)
+    if (substr(fp, 1, 1) != "/") fp <- paste0("/", fp)   # Windows: file:///C:/...
+    url <- paste0("file://", utils::URLencode(fp), "?print-pdf")
+    cat("  Printing", basename(html_file), "in reveal.js print view...\n")
+    # chromote applies getOption("chromote.timeout", 10) to EVERY command, including
+    # Page.printToPDF. Rasterising ~45 full-page figures takes far longer than 10s, so
+    # raise it BEFORE the session is created (the option is read when the connection
+    # opens). Restored on exit so we do not leak the setting into the rest of the run.
+    old_to <- getOption("chromote.timeout", 10)
+    options(chromote.timeout = timeout_s)
+    on.exit(options(chromote.timeout = old_to), add = TRUE)
+    b <- chromote::ChromoteSession$new()
+    on.exit(try(b$close(), silent = TRUE), add = TRUE)
+    b$Page$navigate(url)
+    try(b$Page$loadEventFired(), silent = TRUE)
+    Sys.sleep(wait)   # let the figures, fonts and reveal's print layout settle
+    # transferMode = "ReturnAsStream" is essential. The default returns the WHOLE
+    # PDF as base64 inside a single WebSocket message, and a figure-heavy deck
+    # blows the websocketpp message-size limit: the socket dies with
+    # "consume error: websocketpp.processor:4 (A message was too large)", the
+    # reply never arrives, and chromote then reports a misleading printToPDF
+    # timeout. Streaming hands back a handle instead, which we drain in chunks,
+    # so deck size stops mattering.
+    res <- b$Page$printToPDF(printBackground = TRUE, preferCSSPageSize = TRUE,
+                             marginTop = 0, marginBottom = 0,
+                             marginLeft = 0, marginRight = 0,
+                             transferMode = "ReturnAsStream")
+    con <- file(pdf_file, "wb")
+    on.exit(try(close(con), silent = TRUE), add = TRUE)
+    repeat {
+      chunk <- b$IO$read(handle = res$stream, size = 524288)   # 512 KB at a time
+      if (!is.null(chunk$data) && nzchar(chunk$data)) {
+        writeBin(if (isTRUE(chunk$base64Encoded)) jsonlite::base64_dec(chunk$data)
+                 else charToRaw(chunk$data), con)
+      }
+      if (isTRUE(chunk$eof)) break
+    }
+    close(con)
+    try(b$IO$close(handle = res$stream), silent = TRUE)
+    file.exists(pdf_file) && file.size(pdf_file) > 0
+  }, error = function(e) {
+    cat("  PDF export failed:", conditionMessage(e), "\n")
+    cat("  Chrome not installed, PDF open in another app, or a slow render - raise\n")
+    cat("  pdf_timeout_s, currently", timeout_s, "seconds.\n")
+    FALSE
+  })
+  isTRUE(ok)
+}
+
 if (requireNamespace("quarto", quietly = TRUE)) {
   
   # Render HTML slideshow
@@ -3717,8 +4628,47 @@ if (requireNamespace("quarto", quietly = TRUE)) {
     })
   }
   
-  if (!render_html && !render_powerpoint) {
-    cat("\nNo output formats selected. Set render_html or render_powerpoint to TRUE.\n\n")
+  # Export a PDF copy of the HTML deck
+  if (render_pdf) {
+    cat("\n=== EXPORTING PDF ===\n")
+    html_out <- sub("\\.qmd$", ".html", qmd_path)
+    pdf_out  <- sub("\\.qmd$", ".pdf",  qmd_path)
+    if (!file.exists(html_out)) {
+      cat("  No HTML deck found - set render_html <- TRUE and re-run.\n\n")
+    } else {
+      # Print from a downsampled copy so the PDF is not 10x bigger than it needs to be
+      src_html  <- html_out
+      build_dir <- NULL
+      if (is.numeric(pdf_max_px) && pdf_max_px > 0) {
+        cat("  Preparing a downsampled copy of the deck...\n")
+        src_html <- tryCatch(build_pdf_copy(slides_dir, html_out, pdf_max_px),
+                             error = function(e) {
+                               cat("    downsample failed:", conditionMessage(e),
+                                   "- printing at full size\n")
+                               html_out
+                             })
+        if (!identical(src_html, html_out)) build_dir <- dirname(src_html)
+      }
+      pdf_ok <- export_deck_pdf(src_html, pdf_out, wait = pdf_wait_s,
+                                timeout_s = pdf_timeout_s)
+      if (!is.null(build_dir)) unlink(build_dir, recursive = TRUE)
+      if (pdf_ok) {
+        cat("\n*** PDF SUCCESS ***\n")
+        cat("PDF created:", pdf_out, "\n")
+        cat("  File size:", round(file.size(pdf_out)/1024/1024, 1), "MB")
+        if (!is.null(build_dir)) cat("  (figures capped at ", pdf_max_px, "px)", sep = "")
+        cat("\n  Too big? Lower pdf_max_px. Too soft? Raise it, or set 0 for full size.\n\n")
+      } else {
+        cat("\n  PDF not created. To export it by hand:\n")
+        cat("    1. Open", basename(html_out), "in Chrome from inside the slides folder\n")
+        cat("    2. Add ?print-pdf to the end of the address and reload\n")
+        cat("    3. Ctrl+P > Save as PDF; Margins: None; Background graphics: ON\n\n")
+      }
+    }
+  }
+
+  if (!render_html && !render_powerpoint && !render_pdf) {
+    cat("\nNo output formats selected. Set render_html, render_powerpoint or render_pdf to TRUE.\n\n")
   }
   
 } else {
